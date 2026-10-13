@@ -1,0 +1,22 @@
+# dsh-cu bundle layer: computer use on KDE Plasma for DeepSeek Harness.
+#
+# Install: dsh plugin --profile web add "github:anthony1x6000/dsh-cu#main"
+# Local:   dsh plugin --profile web add "link:/home/virt/Projects/dsh-cu"
+#
+# One row. The plugin registers its `cu_*` tools on `ctx.tools` and spawns the
+# Python bridge shipped beside it (`bin/dsh-cu-bridge`) on first use, so nothing
+# here needs to know where the package was installed.
+#
+# A later layer can override any field; to configure it in place, add a row with
+# the same id and the config you want, for example:
+#
+#   - id: dsh-cu
+#     config:
+#       python: python3
+#       scriptDir: /home/me/.local/state/dsh-cu/kwin-scripts
+#       screenshotDir: /home/me/Pictures/dsh-cu
+#       enableInput: true
+
+- insert:
+    - id: dsh-cu
+      name: 'dsh-cu'

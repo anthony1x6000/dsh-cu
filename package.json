@@ -1,0 +1,68 @@
+{
+  "name": "dsh-cu",
+  "version": "0.1.0",
+  "description": "Computer use on KDE Plasma 6 Wayland for DeepSeek Harness: windows, screenshots, EIS input injection, the AT-SPI accessibility tree, and flatpak apps",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "computer-use",
+    "gui-automation",
+    "kde-plasma",
+    "kwin",
+    "wayland",
+    "flatpak",
+    "libei",
+    "eis",
+    "at-spi2",
+    "accessibility"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/index.d.ts",
+    "bin/dsh-cu-bridge",
+    "python",
+    "tools",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "bin": {
+    "dsh-cu-bridge": "./bin/dsh-cu-bridge"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "selfcheck": "node --experimental-strip-types selfcheck.ts",
+    "test:python": "python3 -m unittest discover -s tests -p 'test_*.py' -v",
+    "test:integration": "python3 tests/integration.py",
+    "test": "pnpm run selfcheck && pnpm run test:python"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anthony1x6000/dsh-cu.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "packageManager": "pnpm@12.4.2",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

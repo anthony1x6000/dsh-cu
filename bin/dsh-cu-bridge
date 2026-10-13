@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# dsh-cu-bridge — launch the dsh-cu Python bridge.
+#
+# The TypeScript plugin spawns this script with `--serve` and speaks
+# newline-delimited JSON over stdio. Invoking it directly is also the supported
+# way to debug a single operation:
+#
+#   bin/dsh-cu-bridge --detect                       capability report
+#   bin/dsh-cu-bridge --ops                          list operations
+#   bin/dsh-cu-bridge window.list '{"app":"brave"}'  one operation, JSON in/out
+#   bin/dsh-cu-bridge --serve                        the resident protocol
+#
+# Environment:
+#   DSH_CU_PYTHON          interpreter to use (default: python3)
+#   DSH_CU_SCRIPT_DIR      directory KWin can read for temporary scripts
+#                          (needed when /tmp is private to the caller)
+#   DSH_CU_STATE_DIR       state directory for logs and screenshots
+#   DSH_CU_SCREENSHOT_DIR  default screenshot output directory
+set -euo pipefail
+
+HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname -- "$HERE")"
+PYTHON="${DSH_CU_PYTHON:-python3}"
+
+if [ ! -d "$ROOT/python/dsh_cu_bridge" ]; then
+  printf 'dsh-cu-bridge: %s/python/dsh_cu_bridge is missing; reinstall the dsh-cu bundle\n' "$ROOT" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$ROOT/python${PYTHONPATH:+:$PYTHONPATH}"
+# The bridge talks to the session it is started from; unset anything that would
+# point it at a different compositor.
+unset DBUS_STARTER_ADDRESS DBUS_STARTER_BUS_TYPE 2>/dev/null || true
+
+exec "$PYTHON" -m dsh_cu_bridge "$@"

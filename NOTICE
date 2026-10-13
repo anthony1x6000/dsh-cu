@@ -1,0 +1,47 @@
+# NOTICE
+
+dsh-cu — computer use on KDE Plasma 6 Wayland for DeepSeek Harness.
+
+## Inherited licence and attribution
+
+This project is derived from **kwin-mcp** — <https://github.com/isac322/kwin-mcp>
+— Copyright (c) 2026 Byeonghoon Yoo, licensed under the MIT License. That
+licence is inherited by this work, and the corresponding permission notice is
+reproduced in `LICENSE`.
+
+The derivation is a re-implementation in Python and TypeScript of techniques
+and, in places, code that kwin-mcp established for KDE Plasma 6 Wayland:
+
+| dsh-cu | Derived from (kwin-mcp) | What was carried over |
+| --- | --- | --- |
+| `python/dsh_cu_bridge/kwin.py` | `src/kwin_mcp/geometry.py` | the `loadScript`/`callDBus` sink transport, the window/geometry script templates, one-pass placeholder rendering, the `internalId`-keyed actions |
+| `python/dsh_cu_bridge/shot.py` | `src/kwin_mcp/screenshot.py` | `CaptureWorkspace` over a pipe fd with a concurrent drain thread, the `QImage::Format` → PIL raw-mode table, logical-origin mapping and the ±2 px size tolerance |
+| `python/dsh_cu_bridge/eis.py` | `src/kwin_mcp/input.py` | the KWin `EIS.RemoteDesktop` connection and cookie, the libei ctypes prototypes and constants, resume-driven `ei_device_start_emulating`, device-replacement handling, the same-position pointer nudge, chord ordering |
+| `python/dsh_cu_bridge/keys.py` | `src/kwin_mcp/input.py` | the US-QWERTY evdev table, the terminal paste-chord policy |
+| `python/dsh_cu_bridge/atspi.py` | `src/kwin_mcp/accessibility.py` | the window-local → global coordinate translation, the top-level ↔ KWin matching rules and their fail-closed reasons, the stability re-check, the flatpak `xdg-dbus-proxy` scope alias |
+| `python/dsh_cu_bridge/flatpak.py` | `src/kwin_mcp/accessibility.py`, `src/kwin_mcp/session.py` | `/proc/<pid>/cgroup` scope parsing, the `app-flatpak-<app-id>-<n>.scope` pattern |
+
+## Deliberate differences
+
+* **A resident JSON-RPC bridge instead of an MCP server.** dsh-cu exposes native
+  DeepSeek Harness tools on `ctx.tools`; the Python side is a private transport
+  the plugin spawns, not a server another client connects to.
+* **Both screenshot backends.** kwin-mcp uses ScreenShot2 and never captures at
+  unrestricted authorization; dsh-cu adds Spectacle as a fallback because KWin
+  gates ScreenShot2 behind a `.desktop` grant, plus blank-frame and session-lock
+  reporting.
+* **Flatpak identity as a first-class field.** Window and accessibility results
+  carry `flatpakAppId`, and flatpak launch waits for the window of the app's own
+  cgroup scope.
+* **A flatpak identity fallback for sandboxed callers.** When `/proc` cannot show
+  another namespace's pids, the app id comes from `flatpak ps`, which resolves
+  them through cgroupfs.
+* **No headless virtual session.** dsh-cu targets the live desktop, which is
+  where its tools are useful; kwin-mcp's `kwin_wayland --virtual` sessions are
+  out of scope.
+
+## Other components
+
+* Node builtins only in `index.ts`; no npm runtime dependencies.
+* The Python bridge uses the distribution's `python3` with PyGObject, dbus-python,
+  Pillow, and `libei.so.1` — all system packages, nothing vendored.
