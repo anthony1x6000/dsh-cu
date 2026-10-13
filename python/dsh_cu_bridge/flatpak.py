@@ -28,6 +28,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import dbus
+
+from . import session
 from .rpc import BridgeError
 
 PROC = Path("/proc")
@@ -50,6 +53,8 @@ FLATPAK_TIMEOUT_S = 15.0
 # list enriches many pids at once.
 _PS_CACHE_S = 2.0
 _ps_cache: tuple[float, dict[int, str]] | None = None
+# pid -> (probe time, app id) for the systemd identity fallback.
+_pid_unit_cache: dict[int, tuple[float, str | None]] = {}
 
 
 def _run(argv: list[str], timeout: float = FLATPAK_TIMEOUT_S) -> str:
@@ -134,15 +139,84 @@ def instance_from_scope(scope: str | None) -> str | None:
 def app_id_for_pid(pid: int) -> str | None:
     """The flatpak app id owning ``pid``.
 
-    The instance's cgroup scope is the exact source and needs no CLI call. When
-    ``/proc`` cannot show the pid — a caller inside its own PID namespace, such
-    as a sandboxed harness process — ``flatpak ps`` still resolves it through
-    cgroupfs, so that table is the fallback.
+    Three sources, in order of directness, because no single one works
+    everywhere:
+
+    1. ``/proc/<pid>/cgroup`` — exact, one file read, and it resolves *any*
+       process in the sandbox including ``xdg-dbus-proxy``. It cannot see another
+       PID namespace's processes.
+    2. the user systemd manager's ``GetUnitByPID`` — systemd resolves the number
+       on the host side and answers with the unit, which for a sandboxed app is
+       its ``app-flatpak-<app-id>-<n>.scope``. This is the source that survives
+       being sandboxed: cgroupfs reports a foreign pid as 0 from inside a PID
+       namespace, so reading it directly is not an option.
+    3. ``flatpak ps`` — the instance table, which covers instance main pids when
+       systemd has no unit loaded for them.
     """
     app_id = app_id_from_scope(cgroup_scope(pid))
     if app_id:
         return app_id
+    app_id = app_id_from_systemd(pid)
+    if app_id:
+        return app_id
     return instance_map().get(int(pid))
+
+
+# systemd escapes a unit name into a path: '-' -> '_2d', '.' -> '_2e', '_' -> '_5f'.
+_SYSTEMD_UNIT_PREFIX = "app_2dflatpak_2d"
+_SYSTEMD_UNIT_SUFFIX = "_2escope"
+
+
+def _unescape_unit_name(escaped: str) -> str:
+    """Undo systemd's unit-name escaping."""
+    return escaped.replace("_2d", "-").replace("_2e", ".").replace("_5f", "_")
+
+
+def app_id_from_systemd_unit(unit: str) -> str | None:
+    """Extract an app id from a systemd unit path or name, or None.
+
+    Accepts either the object path systemd returns
+    (``/org/freedesktop/systemd1/unit/app_2dflatpak_2d…_2escope``) or a bare unit
+    name, so a caller holding either form can use it.
+    """
+    name = unit.strip().rsplit("/", 1)[-1]
+    if not name.startswith(_SYSTEMD_UNIT_PREFIX) or not name.endswith(_SYSTEMD_UNIT_SUFFIX):
+        return None
+    body = name[len(_SYSTEMD_UNIT_PREFIX):-len(_SYSTEMD_UNIT_SUFFIX)]
+    app_id, _, instance = body.rpartition("_2d")
+    if not app_id or not instance.isdigit():
+        return None
+    return _unescape_unit_name(app_id)
+
+
+def app_id_from_systemd(pid: int) -> str | None:
+    """Resolve a pid to its flatpak app through the user systemd manager.
+
+    This is the identity path that works from inside a PID namespace, where
+    ``/proc`` has no entry for the pid and cgroupfs reports it as 0: the lookup
+    happens inside systemd, which lives in the host namespace.
+    """
+    now = time.monotonic()
+    cached = _pid_unit_cache.get(int(pid))
+    if cached is not None and now - cached[0] < _PS_CACHE_S:
+        return cached[1]
+    resolved: str | None = None
+    try:
+        address = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        bus = dbus.bus.BusConnection(address) if address else dbus.SessionBus()
+        manager = bus.get_object("org.freedesktop.systemd1", "/org/freedesktop/systemd1")
+        unit = manager.GetUnitByPID(
+            dbus.UInt32(int(pid)), dbus_interface="org.freedesktop.systemd1.Manager"
+        )
+        resolved = app_id_from_systemd_unit(str(unit))
+    except dbus.DBusException:
+        # "PID does not belong to any loaded unit" is the common case for an
+        # ordinary application, not a failure worth surfacing.
+        resolved = None
+    except Exception:  # noqa: BLE001 - identity lookup must never break a listing
+        resolved = None
+    _pid_unit_cache[int(pid)] = (now, resolved)
+    return resolved
 
 
 def instance_map() -> dict[int, str]:
@@ -355,7 +429,6 @@ def launch(
 
 def _log_path(app_id: str) -> Path:
     """The append-only log file used for one launched app."""
-    base = Path(os.environ.get("DSH_CU_STATE_DIR") or (Path.home() / ".local" / "state" / "dsh-cu"))
-    directory = base / "logs"
+    directory = session.state_dir() / "logs"
     directory.mkdir(parents=True, exist_ok=True)
     return directory / f"{app_id}.log"

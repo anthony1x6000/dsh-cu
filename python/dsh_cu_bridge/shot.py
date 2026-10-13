@@ -26,6 +26,7 @@ import os
 import select
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -220,25 +221,87 @@ def _spectacle_binary() -> str:
     return binary
 
 
+def _spectacle_env_for(config_writable: bool, state: Path, temp: Path) -> dict[str, str]:
+    """The XDG redirection Spectacle needs, given where it is running from.
+
+    Spectacle reads and writes ``spectaclerc`` through the XDG directories, and
+    when it cannot it refuses to capture: it pops a modal dialog
+    ("Configuration file … not writable") and exits 0 *without writing an image*.
+    A caller inside a read-only sandbox — the DSH bash sandbox bind-mounts the
+    filesystem read-only — hits exactly that, and the failure looks like nothing
+    happened.
+
+    When the ambient directories are writable nothing is redirected, so the
+    user's own Spectacle settings apply. Otherwise private directories are used:
+    under the state directory when that can be written, else under the temporary
+    directory (which is writable inside a sandbox, and shared with the Spectacle
+    child because it runs in the same mount namespace).
+
+    @param config_writable - whether the ambient XDG config directory can be written.
+    @param state - the plugin's state directory.
+    @param temp - the temporary directory to fall back to.
+    @returns environment entries to merge into the Spectacle child's environment.
+    """
+    if config_writable:
+        return {}
+    base = state / "spectacle"
+    if not session.writable(base / "config"):
+        base = temp / "dsh-cu-spectacle"
+    for name in ("config", "cache", "data"):
+        # Spectacle is given the directories, so they have to exist: a missing
+        # XDG_CONFIG_HOME is a different failure than one it cannot write.
+        try:
+            (base / name).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise BridgeError(
+                f"cannot create a writable configuration directory for Spectacle at {base / name}: {exc}",
+                "SPECTACLE_CONFIG_UNWRITABLE",
+            ) from exc
+    return {
+        "XDG_CONFIG_HOME": str(base / "config"),
+        "XDG_CACHE_HOME": str(base / "cache"),
+        "XDG_DATA_HOME": str(base / "data"),
+    }
+
+
+def spectacle_env() -> dict[str, str]:
+    """The environment overrides to run Spectacle with, probed for this caller."""
+    return _spectacle_env_for(
+        session.writable(session.config_home()),
+        session.state_dir(),
+        Path(tempfile.gettempdir()),
+    )
+
+
 def _capture_spectacle(mode: str, output: Path, include_cursor: bool = False, extra: tuple[str, ...] = ()) -> Path:
     """Capture with Spectacle in background mode; ``mode`` is an argv fragment."""
     binary = _spectacle_binary()
     argv = [binary, "-b", "-n", *mode.split(), *extra, "-o", str(output)]
     if include_cursor:
         argv.insert(1, "-p")
+    overrides = spectacle_env()
+    env = {**os.environ, **overrides}
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=SPECTACLE_TIMEOUT_S, check=False
+            argv, capture_output=True, text=True, timeout=SPECTACLE_TIMEOUT_S, check=False, env=env
         )
     except subprocess.TimeoutExpired as exc:
         raise BridgeError(
-            f"Spectacle did not finish within {SPECTACLE_TIMEOUT_S:g}s",
+            f"Spectacle did not finish within {SPECTACLE_TIMEOUT_S:g}s"
+            + ("" if not overrides else f" (running with XDG_CONFIG_HOME={overrides['XDG_CONFIG_HOME']})"),
             "SCREENSHOT_TIMEOUT",
         ) from exc
     if not output.is_file() or output.stat().st_size == 0:
         detail = (completed.stderr or completed.stdout or "").strip()[-300:]
+        hint = ""
+        if not session.writable(session.config_home()):
+            hint = (
+                f" The XDG config directory {session.config_home()} is not writable (a read-only "
+                "sandbox?); Spectacle needs a writable one, so it was given a private directory "
+                "instead — if this still failed, run the plugin from an unsandboxed process."
+            )
         raise BridgeError(
-            f"Spectacle wrote no image (exit {completed.returncode}): {detail}",
+            f"Spectacle wrote no image (exit {completed.returncode}): {detail or 'no output'}.{hint}",
             "SCREENSHOT_EMPTY",
         )
     return output
@@ -249,21 +312,31 @@ def _screenshot_dir() -> Path:
     override = os.environ.get("DSH_CU_SCREENSHOT_DIR")
     if override:
         return Path(override)
-    state = os.environ.get("DSH_CU_STATE_DIR")
-    base = Path(state) if state else Path.home() / ".local" / "state" / "dsh-cu"
-    return base / "screenshots"
+    return session.state_dir() / "screenshots"
 
 
 def _target_path(save_to: str | None, kind: str) -> Path:
-    """Resolve the output path for one capture, creating its directory."""
+    """Resolve the output path for one capture, creating its directory.
+
+    An explicit destination is honoured and fails loudly when it cannot be
+    written. The *default* directory falls back to the temporary directory when
+    the state directory is unusable, which is the case when the caller runs
+    inside a read-only sandbox and named no destination.
+    """
     if save_to:
         path = Path(save_to).expanduser()
         if path.is_dir():
             path = path / f"dsh-cu-{kind}-{int(time.time())}.png"
-    else:
-        path = _screenshot_dir() / f"dsh-cu-{kind}-{int(time.time() * 1000)}.png"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise BridgeError(f"cannot create {path.parent}: {exc}", "SCREENSHOT_WRITE_FAILED") from exc
+        return path
+    directory = _screenshot_dir()
+    if not session.writable(directory):
+        directory = Path(tempfile.gettempdir()) / "dsh-cu-screenshots"
+        directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"dsh-cu-{kind}-{int(time.time() * 1000)}.png"
 
 
 def _uniform_colour(image: Any) -> tuple[int, int, int] | None:

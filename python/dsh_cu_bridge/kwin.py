@@ -36,6 +36,7 @@ import dbus.bus
 import dbus.service
 from dbus.mainloop.glib import DBusGMainLoop
 
+from . import session
 from .rpc import BridgeError
 
 SINK_NAME = "dev.dshcu.KWinBridge"
@@ -203,6 +204,33 @@ def _session_bus() -> Any:
     return dbus.SessionBus()
 
 
+def script_dir(env: dict[str, str] | None = None, cwd: str | None = None, sandboxed: bool | None = None) -> Path:
+    """Where the temporary KWin scripts are written.
+
+    KWin is a different process, so it can only load a script from a directory it
+    can see. That rules out a private ``/tmp``, which is exactly what a sandboxed
+    caller gets: the DSH bash sandbox mounts a fresh tmpfs at ``/tmp`` while
+    bind-mounting the workspace at its real path. So an explicit
+    ``DSH_CU_SCRIPT_DIR`` wins; next, when the caller looks sandboxed, the current
+    directory (usually the shared workspace) is used; only then the temporary
+    directory, which is correct for an unsandboxed process.
+
+    @param env - environment to read the override from; the process environment by default.
+    @param cwd - directory to fall back to when sandboxed; the process's own by default.
+    @param sandboxed - override the sandbox probe, for a caller that already knows.
+    @returns the directory KWin scripts are written to.
+    """
+    environment = os.environ if env is None else env
+    override = environment.get("DSH_CU_SCRIPT_DIR")
+    if override:
+        return Path(override)
+    in_sandbox = session.sandboxed() if sandboxed is None else sandboxed
+    here = Path(cwd or os.getcwd())
+    if in_sandbox and session.writable(here):
+        return here / ".dsh-cu-scripts"
+    return Path(tempfile.gettempdir())
+
+
 def run_kwin_script(js_source: str, timeout: float = SCRIPT_TIMEOUT_S) -> str:
     """Run one KWin script and return the payload it reported over D-Bus.
 
@@ -226,11 +254,12 @@ def run_kwin_script(js_source: str, timeout: float = SCRIPT_TIMEOUT_S) -> str:
     sink = _Sink(bus, SINK_PATH)
 
     # The script must live somewhere KWin can read. A sandboxed caller whose
-    # /tmp is private points DSH_CU_SCRIPT_DIR at a shared directory.
-    script_dir = Path(os.environ.get("DSH_CU_SCRIPT_DIR") or tempfile.gettempdir())
-    script_dir.mkdir(parents=True, exist_ok=True)
+    # /tmp is private points DSH_CU_SCRIPT_DIR at a shared directory, or gets the
+    # current directory instead (see script_dir).
+    script_dir_path = script_dir()
+    script_dir_path.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
-        "w", prefix="dsh-cu-kwin-", suffix=".js", dir=script_dir, delete=False
+        "w", prefix="dsh-cu-kwin-", suffix=".js", dir=script_dir_path, delete=False
     )
     script_path = Path(handle.name)
     try:

@@ -90,7 +90,7 @@ file:
 
 | Tool | What it does |
 | --- | --- |
-| `cu_status` | Capability report: KWin and output geometry, input injection, screenshot backends and authorization, accessibility bus and lock state, Klipper, installed and running flatpak apps, plus an actionable hint per degraded part. |
+| `cu_status` | Capability report: KWin and output geometry, input injection, screenshot backends and authorization, accessibility bus, lock state, whether the caller is sandboxed, Klipper, installed and running flatpak apps, plus an actionable hint per degraded part. |
 | `cu_windows` | Windows from KWin with exact geometry, ids, pids, and `flatpakAppId`. The only view that also sees apps publishing no accessibility tree. |
 | `cu_window` | `info`, `activate`, `close`, `minimize`, `maximize`, `fullscreen`, `keep_above`, `on_all_desktops`, `geometry`. Reports state before/after and `refused` when the window disallows it. |
 | `cu_screenshot` | Workspace, one window, or one area → PNG, with the logical origin/size and a coordinate note. Flags a uniform frame and a locked session. |
@@ -139,11 +139,13 @@ compositor-level injection reaches the sandbox.
 
 Identity and accessibility do:
 
-* **Windows.** `cu_windows` resolves each pid through
-  `/proc/<pid>/cgroup` to its `app-flatpak-<app-id>-<n>.scope` and reports
-  `flatpakAppId`. When `/proc` cannot show the pid (the caller runs in its own
-  PID namespace, as under a sandbox), the app id comes from `flatpak ps`, which
-  resolves pids through cgroupfs instead.
+* **Windows.** `cu_windows` resolves each pid to its
+  `app-flatpak-<app-id>-<n>.scope` and reports `flatpakAppId`, from three sources
+  in order: `/proc/<pid>/cgroup` (exact, and it also resolves the sandbox's
+  `xdg-dbus-proxy`), then the user systemd manager's `GetUnitByPID` (systemd
+  resolves the number on the host side, so this works from inside a PID
+  namespace where `/proc` shows nothing and cgroupfs reports foreign pids as 0),
+  then the `flatpak ps` instance table.
 * **Accessibility.** A sandboxed app reaches the accessibility bus through its
   sandbox's `xdg-dbus-proxy`, so AT-SPI reports the *proxy's* pid while KWin
   reports the app's. `cu_a11y_windows` shows both (`pid` is the proxy,
@@ -274,9 +276,20 @@ mutating ones (`window`, `mouse`, `keyboard`, `a11y_invoke`, `launch`,
   before driving applications.
 * **Display off.** An idle session can blank the output, and captures come back a
   uniform colour. Synthetic input usually wakes it.
-* **Private `/tmp`.** Window control writes a temporary KWin script that **KWin**
-  must read. If the harness runs with a private `/tmp`, set `scriptDir` to a
-  shared directory, or the scripts will time out.
+* **Sandboxed callers.** The plugin belongs in the DSH server process, which is
+  not sandboxed. If the bridge is instead driven from a sandboxed shell (the DSH
+  bash tool bind-mounts the filesystem read-only), three things break and are
+  handled automatically:
+  * *Spectacle refuses to capture* — it cannot write `spectaclerc`, so it shows a
+    modal "Configuration file … not writable" dialog and exits 0 **without an
+    image**. The bridge now gives Spectacle private writable XDG directories, so
+    capture works and the dialog never appears.
+  * *KWin cannot read a script written to a private `/tmp`.* The bridge falls back
+    to a `.dsh-cu-scripts` directory under the current directory (the shared
+    workspace); set `scriptDir` when the working directory is not shared either.
+  * *The default screenshot directory may be unwritable.* An explicit `saveTo`
+    always wins; the default falls back to the temporary directory.
+  `cu_status` reports `sandboxed` and the writability of each directory.
 * **Chromium trees.** A minimized or unrendered Chromium window may expose only
   its top-level frame; activate it and re-query.
 * **Wine, Flutter, some Electron apps** publish no usable accessibility tree.
@@ -296,9 +309,10 @@ pnpm test:integration   # live checks against the running desktop
 `selfcheck` runs a fake bridge that speaks the same frames, so it needs no
 desktop. `test:integration` drives the real session and is conservative: it
 restores the pointer to where it found it, skips keyboard input while the session
-is locked, and performs no visible window change. On the machine this was built
-on it reports 14 of 15 checks passing with the keyboard check skipped because the
-session was locked.
+is locked, and closes only the flatpak window it launched itself. It also runs the
+bridge inside a read-only `bwrap` sandbox to prove that capture, window control,
+and flatpak identity work there with no environment hints. On the machine this was
+built on: 45 unit tests, and 17 integration checks passing.
 
 ## Architecture
 
@@ -319,8 +333,8 @@ python/dsh_cu_bridge/
   session.py                 lock state
   status.py                  capability probe
 tools/authorize-screenshot.sh
-tests/test_pure.py           unit tests
-tests/integration.py         live desktop checks
+tests/test_pure.py           unit tests (identity, keys, matching, mapping, sandbox fallbacks)
+tests/integration.py         live desktop checks, including a read-only-sandbox run
 ```
 
 The bridge is spawned once (`--serve`) on first tool use and kept resident: the

@@ -107,6 +107,14 @@ def probe(refresh_screenshot_authorization: bool = False) -> dict[str, Any]:
             "The session is locked: screenshots show the lock screen and synthetic input lands on "
             "it, not on the user's windows. Unlock the session before driving applications."
         )
+    if session_report.get("sandboxed"):
+        hints.append(
+            f"The XDG config directory ({session.config_home()}) is not writable, so this process runs "
+            "inside a read-only sandbox. Screenshots are routed to a private Spectacle configuration and "
+            "the state directory is unusable, but window control still needs scriptDir to name a directory "
+            "KWin can read (a private /tmp is not one), and a screenshot destination should be given "
+            "explicitly. The plugin belongs in the DSH server process, which is not sandboxed."
+        )
 
     kwin_report: dict[str, Any] = {"available": False}
     try:

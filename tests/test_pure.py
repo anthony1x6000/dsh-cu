@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-from dsh_cu_bridge import atspi, flatpak, keys, kwin, rpc, shot  # noqa: E402
+from dsh_cu_bridge import atspi, flatpak, keys, kwin, rpc, session, shot  # noqa: E402
 
 
 class FlatpakScopeTests(unittest.TestCase):
@@ -57,6 +57,37 @@ class FlatpakScopeTests(unittest.TestCase):
     def test_instance_keeps_the_counter(self) -> None:
         scope = "/a/b/app-flatpak-com.brave.Browser-441856390.scope"
         self.assertEqual(flatpak.instance_from_scope(scope), "com.brave.Browser-441856390")
+
+
+class SystemdIdentityTests(unittest.TestCase):
+    """The identity path that survives a PID namespace."""
+
+    def test_unit_paths_from_the_real_systemd_resolve(self) -> None:
+        cases = {
+            "/org/freedesktop/systemd1/unit/app_2dflatpak_2dcom_2ebrave_2eBrowser_2d441856390_2escope":
+                "com.brave.Browser",
+            "/org/freedesktop/systemd1/unit/app_2dflatpak_2dorg_2evinegarhq_2eVinegar_2d484908348_2escope":
+                "org.vinegarhq.Vinegar",
+            # A bare unit name works too, so a caller holding either form can use it.
+            "app_2dflatpak_2dcom_2ebrave_2eBrowser_2d441856390_2escope": "com.brave.Browser",
+            # An escaped underscore inside the app id.
+            "app_2dflatpak_2dio_2egithub_2efoo_5fbar_2d7_2escope": "io.github.foo_bar",
+        }
+        for unit, expected in cases.items():
+            with self.subTest(unit=unit):
+                self.assertEqual(flatpak.app_id_from_systemd_unit(unit), expected)
+
+    def test_non_flatpak_and_malformed_units_are_not_identified(self) -> None:
+        for unit in (
+            "/org/freedesktop/systemd1/unit/plasma_2dplasmashell_2eservice",
+            "/org/freedesktop/systemd1/unit/app_2dorg_2ekde_2ekonsole_2d96520_2escope",
+            # A scope with no instance counter is not a flatpak app scope.
+            "app_2dflatpak_2dcom_2ebrave_2eBrowser_2escope",
+            "app_2dflatpak_2dcom_2ebrave_2eBrowser_2dnotanumber_2escope",
+            "",
+        ):
+            with self.subTest(unit=unit):
+                self.assertIsNone(flatpak.app_id_from_systemd_unit(unit))
 
 
 class KeyTests(unittest.TestCase):
@@ -354,6 +385,66 @@ class EnvironmentTests(unittest.TestCase):
         os.environ["DSH_CU_SCREENSHOT_DIR"] = "/tmp/dsh-cu-test-shots"
         self.addCleanup(lambda: os.environ.pop("DSH_CU_SCREENSHOT_DIR", None) if previous is None else os.environ.update({"DSH_CU_SCREENSHOT_DIR": previous}))
         self.assertEqual(shot._screenshot_dir(), Path("/tmp/dsh-cu-test-shots"))
+
+
+class WritabilityTests(unittest.TestCase):
+    """A read-only filesystem is the condition that breaks Spectacle silently."""
+
+    def test_a_read_only_directory_is_reported_unwritable(self) -> None:
+        self.assertFalse(session.writable(Path("/proc/self/definitely-not-writable")))
+
+    def test_a_temporary_directory_is_writable_and_left_clean(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            target = Path(scratch) / "fresh" / "nested"
+            self.assertTrue(session.writable(target))
+            self.assertTrue(target.is_dir())
+            # The probe file must not be left behind.
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_describe_names_the_sandbox_and_the_lock_state(self) -> None:
+        described = session.describe()
+        for key in ("locked", "sandboxed", "configWritable", "stateDirWritable", "tmpDir"):
+            self.assertIn(key, described)
+        self.assertIsInstance(described["sandboxed"], bool)
+
+
+class SpectacleEnvironmentTests(unittest.TestCase):
+    """Spectacle refuses to capture when it cannot write spectaclerc."""
+
+    def test_ambient_xdg_is_used_when_it_is_writable(self) -> None:
+        self.assertEqual(shot._spectacle_env_for(True, Path("/tmp/state"), Path("/tmp")), {})
+
+    def test_private_xdg_directories_are_used_when_ambient_is_read_only(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            state = Path(scratch) / "state"
+            overrides = shot._spectacle_env_for(False, state, Path("/tmp"))
+            self.assertEqual(overrides["XDG_CONFIG_HOME"], str(state / "spectacle" / "config"))
+            self.assertEqual(overrides["XDG_CACHE_HOME"], str(state / "spectacle" / "cache"))
+            self.assertEqual(overrides["XDG_DATA_HOME"], str(state / "spectacle" / "data"))
+            self.assertTrue(Path(overrides["XDG_CONFIG_HOME"]).is_dir())
+
+    def test_the_temporary_directory_is_the_last_resort(self) -> None:
+        # A state directory that cannot be created (inside the read-only tree)
+        # must not stop Spectacle from getting a writable configuration.
+        overrides = shot._spectacle_env_for(False, Path("/proc/self/no-state"), Path("/tmp"))
+        self.assertTrue(overrides["XDG_CONFIG_HOME"].startswith("/tmp/dsh-cu-spectacle/"))
+        self.assertTrue(Path(overrides["XDG_CONFIG_HOME"]).is_dir())
+
+    def test_an_unwritable_explicit_destination_fails_loudly(self) -> None:
+        with self.assertRaises(rpc.BridgeError) as ctx:
+            shot._target_path("/proc/self/nope/shot.png", "workspace")
+        self.assertEqual(ctx.exception.code, "SCREENSHOT_WRITE_FAILED")
+
+    def test_the_default_destination_falls_back_to_tmp_when_the_state_dir_is_read_only(self) -> None:
+        previous = os.environ.get("DSH_CU_SCREENSHOT_DIR")
+        os.environ["DSH_CU_SCREENSHOT_DIR"] = "/proc/self/read-only/shots"
+        self.addCleanup(lambda: os.environ.pop("DSH_CU_SCREENSHOT_DIR", None) if previous is None else os.environ.update({"DSH_CU_SCREENSHOT_DIR": previous}))
+        path = shot._target_path(None, "workspace")
+        self.assertTrue(path.parent.name == "dsh-cu-screenshots", str(path))
 
 
 if __name__ == "__main__":

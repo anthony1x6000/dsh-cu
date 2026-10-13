@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -387,6 +389,79 @@ def main() -> int:
             )
 
         check("flatpak: launch, scope match, capture, cleanup", check_flatpak_launch)
+
+        def check_screenshot_in_sandbox() -> str:
+            """Capture from inside a read-only sandbox, the way a bash tool runs.
+
+            This is the regression test for a real failure: with the filesystem
+            bind-mounted read-only, Spectacle cannot write `spectaclerc` and
+            refuses to capture — it shows a modal dialog and exits 0 with no
+            image, which looks like nothing happened. The bridge now gives
+            Spectacle private writable XDG directories, so capture still works and
+            the modal never appears.
+            """
+            if shutil.which("bwrap") is None:
+                raise SkipCheck("bwrap is not installed")
+            if state.get("locked"):
+                raise SkipCheck("the session is locked; a capture could not be verified as content")
+            shared = Path(tempfile.mkdtemp(prefix="dsh-cu-sandbox-", dir=str(ROOT.parent)))
+            try:
+                inner = (
+                    "cd " + str(ROOT) + " && "
+                    f"DSH_CU_SCREENSHOT_DIR={shared} DSH_CU_STATE_DIR={ROOT}/.sandbox-state "
+                    f"./bin/dsh-cu-bridge screenshot "
+                    f"'{{\"target\":\"workspace\",\"maxEdge\":600,\"saveTo\":\"{shared}/sandbox.png\"}}' && "
+                    f"./bin/dsh-cu-bridge window.list '{{}}' > {shared}/windows.json"
+                )
+                completed = subprocess.run(
+                    [
+                        "bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--unshare-pid",
+                        "--proc", "/proc", "--die-with-parent", "--tmpfs", "/tmp",
+                        "--bind", str(ROOT.parent), str(ROOT.parent),
+                        "--", "bash", "-c", inner,
+                    ],
+                    capture_output=True, text=True, timeout=240, check=False,
+                )
+                if completed.returncode != 0:
+                    raise AssertionError(
+                        f"the sandboxed bridge exited {completed.returncode}: "
+                        f"{(completed.stderr or completed.stdout).strip()[-300:]}"
+                    )
+                image = shared / "sandbox.png"
+                if not image.is_file() or image.stat().st_size == 0:
+                    raise AssertionError(f"no image was written inside the sandbox: {completed.stdout.strip()[-300:]}")
+                from PIL import Image
+
+                with Image.open(image) as opened:
+                    colours = opened.convert("RGB").getcolors(maxcolors=1000)
+                if colours is not None and len(colours) == 1:
+                    raise AssertionError("the sandboxed capture is a single uniform colour")
+                # Window control needs a KWin-readable script directory, and
+                # flatpak identity must survive the PID namespace: neither may
+                # need an environment hint.
+                sandboxed = json.loads((shared / "windows.json").read_text())["result"]["windows"]
+                if not sandboxed:
+                    raise AssertionError("the sandboxed window list came back empty")
+                host = {w["pid"]: w["flatpakAppId"] for w in state.get("windows", [])}
+                mismatches = [
+                    (w["pid"], host[w["pid"]], w["flatpakAppId"])
+                    for w in sandboxed
+                    if w["pid"] in host and host[w["pid"]] and host[w["pid"]] != w["flatpakAppId"]
+                ]
+                if mismatches:
+                    raise AssertionError(f"sandboxed flatpak identity disagrees with the host: {mismatches}")
+                identified = [w for w in sandboxed if w["flatpakAppId"]]
+                return (
+                    f"read-only sandbox, no environment hints: captured {opened.width}x{opened.height} "
+                    f"through a private Spectacle configuration, listed {len(sandboxed)} windows, "
+                    f"resolved {len(identified)} flatpak app id(s)"
+                )
+            finally:
+                shutil.rmtree(shared, ignore_errors=True)
+                shutil.rmtree(ROOT / ".sandbox-state", ignore_errors=True)
+                shutil.rmtree(ROOT / ".dsh-cu-scripts", ignore_errors=True)
+
+        check("screenshot: works from inside a read-only sandbox", check_screenshot_in_sandbox)
 
         def check_window_control() -> str:
             candidates = [
