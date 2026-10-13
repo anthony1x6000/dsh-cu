@@ -189,7 +189,7 @@ def op_screenshot(args: dict[str, Any]) -> dict[str, Any]:
 # --- input -------------------------------------------------------------------
 
 
-def _correct_pointer(session: eis.Input, x: int, y: int, tolerance: int = 1) -> dict[str, Any]:
+def _correct_pointer(session: eis.Input, x: int, y: int, tolerance: int = 0) -> dict[str, Any]:
     """Re-issue an absolute move when the pointer did not land where it was asked.
 
     A wake from display power saving, or the very first motion after an EIS
@@ -449,6 +449,26 @@ def _descendants(pid: int) -> set[int]:
     return found
 
 
+def _app_window(app_id: str = "", pids: set[int] | None = None, match: str = "") -> dict[str, Any] | None:
+    """The window that already belongs to an app, or None.
+
+    Used before and after a launch: ``flatpak run`` on an app that is already
+    running brings the existing instance forward instead of opening a second
+    window, so waiting only for a *new* window would time out on a healthy app.
+    """
+    needle = match.lower()
+    for window in kwin.windows():
+        if window["kind"] not in ("normal", "other"):
+            continue
+        if app_id and flatpak.app_id_for_pid(int(window["pid"])) == app_id:
+            return window
+        if pids and int(window["pid"]) in pids:
+            return window
+        if needle and needle in f"{window['app']} {window['caption']}".lower():
+            return window
+    return None
+
+
 def _wait_for_window(
     before_ids: set[str],
     *,
@@ -538,13 +558,30 @@ def op_app_launch(args: dict[str, Any]) -> dict[str, Any]:
         match=match,
         timeout_ms=wait_ms,
     )
+    already_running = False
+    if window is None:
+        # A second `flatpak run` of a running app activates it rather than
+        # opening a window, and a host program may have a window already.
+        window = _app_window(app_id, pids if not app_id else None, match)
+        already_running = window is not None
     result = dict(launch)
+    if window is not None:
+        # Enrich the window the same way cu_windows does, so a caller that only
+        # has the launch result still knows which sandbox it landed in.
+        window = dict(window)
+        window["flatpakAppId"] = flatpak.app_id_for_pid(int(window["pid"]))
     result["window"] = window
-    result["flatpakAppId"] = app_id or (flatpak.app_id_for_pid(int(window["pid"])) if window else None)
+    result["flatpakAppId"] = app_id or (window["flatpakAppId"] if window else None)
+    result["alreadyRunning"] = already_running
     if window is None:
         result["note"] = (
-            f"no new window appeared within {wait_ms}ms; the app may still be starting "
+            f"no window appeared within {wait_ms}ms; the app may still be starting "
             f"(log: {launch.get('logPath')})"
+        )
+    elif already_running:
+        result["note"] = (
+            "the app was already running, so its existing window is returned "
+            "(a second launch brings that instance forward instead of opening a new window)"
         )
     return result
 
@@ -555,7 +592,21 @@ def op_flatpak_info(args: dict[str, Any]) -> dict[str, Any]:
     app_id = _str(args, "appId")
     if app_id:
         detail = flatpak.describe(app_id)
-        detail["accessibility"] = atspi.bus_state()
+        accessibility = atspi.bus_state()
+        # Whether the app actually publishes a tree is the answer that matters:
+        # flatpak allows the accessibility bus by default, so a missing
+        # declaration in the app's own permissions proves nothing.
+        accessibility["appearsOnA11yBus"] = False
+        accessibility["treePublishers"] = []
+        try:
+            applications = atspi.list_windows()["applications"]
+            accessibility["appearsOnA11yBus"] = any(a["flatpakAppId"] == app_id for a in applications)
+            accessibility["treePublishers"] = [
+                a["name"] for a in applications if a["flatpakAppId"] == app_id
+            ]
+        except BridgeError as exc:
+            accessibility["probeError"] = exc.as_payload()
+        detail["accessibility"] = accessibility
         return detail
     return {
         "apps": flatpak.installed_apps(),

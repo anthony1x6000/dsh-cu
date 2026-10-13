@@ -220,10 +220,10 @@ def _spectacle_binary() -> str:
     return binary
 
 
-def _capture_spectacle(mode: str, output: Path, include_cursor: bool = False) -> Path:
+def _capture_spectacle(mode: str, output: Path, include_cursor: bool = False, extra: tuple[str, ...] = ()) -> Path:
     """Capture with Spectacle in background mode; ``mode`` is an argv fragment."""
     binary = _spectacle_binary()
-    argv = [binary, "-b", "-n", *mode.split(), "-o", str(output)]
+    argv = [binary, "-b", "-n", *mode.split(), *extra, "-o", str(output)]
     if include_cursor:
         argv.insert(1, "-p")
     try:
@@ -443,7 +443,10 @@ def capture_window(
     kwin.window_action("activate", window_id=window["id"])
     time.sleep(0.35)
     before = kwin.find_window(window_id=window["id"]) or window
-    _capture_spectacle("-a", path, include_cursor=include_cursor)
+    # ``-S`` drops the window shadow: with it, Spectacle returns an image larger
+    # than every KWin rectangle for the window (a 130px margin was measured), so
+    # no pixel could be mapped to a coordinate.
+    _capture_spectacle("-a", path, include_cursor=include_cursor, extra=("-S",))
     after = kwin.find_window(window_id=window["id"]) or before
     from PIL import Image
 

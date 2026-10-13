@@ -185,11 +185,17 @@ def main() -> int:
                 raise SkipCheck("no flatpak apps installed")
             detail = bridge.result("flatpak.info", {"appId": info["apps"][0]["appId"]})
             permissions = detail["permissions"]
-            if "a11yBusAllowed" not in permissions:
-                raise AssertionError("permissions payload is missing the accessibility check")
+            if "a11yBusDeclared" not in permissions:
+                raise AssertionError("permissions payload is missing the accessibility declaration")
+            if "appearsOnA11yBus" not in detail.get("accessibility", {}):
+                raise AssertionError("flatpak info is missing the authoritative accessibility answer")
+            for instance in info["instances"]:
+                if not instance["scope"].startswith("app-flatpak-"):
+                    raise AssertionError(f"instance {instance['instance']} has a bogus scope {instance['scope']}")
             return (
                 f"{len(info['apps'])} apps, {len(info['instances'])} instances; "
-                f"{detail['appId']} a11yBusAllowed={permissions['a11yBusAllowed']} "
+                f"{detail['appId']} a11yDeclared={permissions['a11yBusDeclared']} "
+                f"publishesTree={detail['accessibility']['appearsOnA11yBus']} "
                 f"sockets={permissions['sockets'] or '(none)'}"
             )
 
@@ -344,6 +350,43 @@ def main() -> int:
             return "unknown chords are refused before injecting input"
 
         check("input: keyboard chord validation", check_keyboard)
+
+        def check_flatpak_launch() -> str:
+            """Launch a flatpak app, find its window by scope, capture it, and clean up.
+
+            Flatseal is the guinea pig because it is small, harmless, and shows the
+            sandbox permissions of every other installed app.
+            """
+            app_id = "com.github.tchx84.Flatseal"
+            installed = {app["appId"] for app in bridge.result("flatpak.info")["apps"]}
+            if app_id not in installed:
+                raise SkipCheck(f"{app_id} is not installed")
+            launched = bridge.result("app.launch", {"appId": app_id, "waitMs": 30_000}, timeout=120.0)
+            window = launched.get("window")
+            if window is None:
+                raise SkipCheck(f"no window appeared: {launched.get('note')}")
+            if window["flatpakAppId"] != app_id:
+                raise AssertionError(f"the window belongs to {window['flatpakAppId']}, not {app_id}")
+            shot = bridge.result(
+                "screenshot",
+                {"target": "window", "windowId": window["id"], "maxEdge": 600,
+                 "saveTo": str(Path(state["screenshot"]["path"]).with_name("flatpak.png"))},
+                timeout=120.0,
+            )
+            if shot["reason"]:
+                raise AssertionError(f"flatpak window capture has no usable mapping: {shot['reason']}")
+            owned = not launched.get("alreadyRunning")
+            if owned:
+                # Only close what this run started: closing a window the user had
+                # open would be rude.
+                bridge.result("window.control", {"action": "close", "windowId": window["id"]})
+            return (
+                f"{app_id} → window {window['frame']} matched by scope, captured "
+                f"{shot['pixels'][0]}x{shot['pixels'][1]} at {tuple(shot['logical']['origin'])}"
+                + (", closed" if owned else ", left open (it was already running)")
+            )
+
+        check("flatpak: launch, scope match, capture, cleanup", check_flatpak_launch)
 
         def check_window_control() -> str:
             candidates = [

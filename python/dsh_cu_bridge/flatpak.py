@@ -174,7 +174,14 @@ def pids_for_app(app_id: str, pids: list[int] | None = None) -> list[int]:
 
 
 def running_instances() -> list[dict[str, Any]]:
-    """Every running flatpak app instance, with its host pid and app id."""
+    """Every running flatpak app instance, with its host pid and app id.
+
+    ``scope`` is the instance's systemd unit name, built from the id flatpak
+    reports. Reading it out of ``/proc`` instead would be wrong for an instance
+    launched from a terminal: ``flatpak ps`` reports the ``flatpak run`` process,
+    which still lives in the caller's scope, while the sandbox's own processes
+    are the ones under ``app-flatpak-<app-id>-<n>.scope``.
+    """
     output = _run(["flatpak", "ps", "--columns=instance,pid,application"])
     instances: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -185,7 +192,7 @@ def running_instances() -> list[dict[str, Any]]:
             "instance": parts[0],
             "pid": int(parts[1]),
             "appId": parts[2],
-            "scope": cgroup_scope(int(parts[1])),
+            "scope": f"{_SCOPE_PREFIX}{parts[2]}-{parts[0]}.scope",
         })
     return instances
 
@@ -242,7 +249,11 @@ def permissions(app_id: str) -> dict[str, Any]:
     return {
         "sections": sections,
         "sessionBusTalk": sorted(talk_names),
-        "a11yBusAllowed": "org.a11y.Bus" in talk_names,
+        # What the app *declares*. Flatpak grants the accessibility bus by
+        # default, so an app with no declaration here still publishes a tree
+        # (Brave does), and an app that declares it still may not register.
+        # The authoritative answer is whether it shows up in cu_a11y_windows.
+        "a11yBusDeclared": "org.a11y.Bus" in talk_names,
         "sockets": sockets,
         "hasWayland": "wayland" in sockets,
         "hasX11": "x11" in sockets or "fallback-x11" in sockets,

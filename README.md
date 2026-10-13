@@ -131,11 +131,51 @@ Identity and accessibility do:
 * **Launching.** `cu_launch { appId: "com.github.tchx84.Flatseal" }` runs
   `flatpak run` and waits for the window belonging to that app's scope — exact
   even with several instances of the same app running.
-* **Diagnosis.** `cu_flatpak { appId }` reports the app's permissions, including
-  whether the sandbox may talk to `org.a11y.Bus`. Toolkit accessibility must also
-  be on for the session; the accessibility tools turn it on
-  (`org.a11y.Status.IsEnabled`), but an app that started while it was off may
-  need a restart before it publishes a tree.
+* **Diagnosis.** `cu_flatpak { appId }` reports the app's declared permissions
+  (`a11yBusDeclared`) and, authoritatively, whether it actually appears on the
+  accessibility bus (`appearsOnA11yBus`). Flatpak grants that bus by default, so
+  a missing declaration proves nothing — Brave declares nothing and still
+  publishes a tree. Toolkit accessibility must also be on for the session; the
+  accessibility tools turn it on (`org.a11y.Status.IsEnabled`), but an app that
+  started while it was off may need a restart before it publishes one.
+
+## Roblox Studio via Vinegar
+
+Roblox Studio runs under Wine inside the Vinegar flatpak, and this plugin was
+verified against exactly that setup:
+
+* `cu_windows` reports Studio's window with `flatpakAppId: org.vinegarhq.Vinegar`
+  and its real frame; the window's pid resolves through the instance's
+  `app-flatpak-org.vinegarhq.Vinegar-<n>.scope`. Note that `flatpak ps` reports
+  the launcher process, which may still sit in the shell's scope — the sandboxed
+  processes are the ones under the app scope, and that is what the identity
+  lookup uses.
+* `cu_screenshot { target: "window", app: "robloxstudiobeta" }` activates the
+  window and captures it at exactly the frame size with a proven 1:1 mapping, so
+  screenshot pixels are click coordinates. This works **even while the session is
+  locked** and the lock screen covers the display, because a window capture
+  renders the window itself.
+* **Wine publishes no accessibility tree**, so `cu_a11y_*` finds nothing for
+  Studio. `cu_flatpak { appId: "org.vinegarhq.Vinegar" }` says so explicitly
+  (`publishesTree: false`, `a11yDeclared: false`). Drive Studio with
+  `cu_screenshot` + `cu_mouse`, and use the Roblox Studio MCP server from the
+  `dsh-rbx` bundle for game-tree work — that is what it is for.
+* Input injection is compositor-level, so it reaches Wine surfaces like any other
+  client: activate the Studio window, then click at coordinates taken from its
+  capture.
+* `cu_launch { appId: "org.vinegarhq.Vinegar" }` starts it and waits for the
+  window of that scope. A second call reports `alreadyRunning: true` and returns
+  the existing window, because `flatpak run` on a running app brings that
+  instance forward instead of opening a new one.
+
+## Flatpak round trip (verified)
+
+```
+cu_launch { appId: "com.github.tchx84.Flatseal" }   → window matched by scope, alreadyRunning false
+cu_screenshot { target: "window", windowId }        → 1024x768 at logical (448, 129), mapping proven
+cu_window { action: "close" }                       → closed
+cu_launch { appId: "com.github.tchx84.Flatseal" }   → alreadyRunning true, same window returned
+```
 
 ## Input
 
@@ -159,7 +199,7 @@ Pointer and keyboard events are injected through KWin's private
 | Backend | Notes |
 | --- | --- |
 | **KWin ScreenShot2** | Fast, per-window and per-area, no consent prompt. Restricted: KWin authorizes a caller only when its executable is named by the `Exec` of a `.desktop` file declaring `X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2`. |
-| **Spectacle** | A KDE application, so already authorized. Captures the whole desktop or the active window; an area is cropped from the full-desktop frame. It cannot capture a window that is not on top, and it needs a rendering session. |
+| **Spectacle** | A KDE application, so already authorized. Captures the whole desktop or the active window (no shadow, so the image matches the window rectangle and pixels map to coordinates); an area is cropped from the full-desktop frame. It cannot capture a window that is not on top, and it needs a rendering session. |
 | **Blank-frame report** | A capture that is a single uniform colour is flagged, because it means the display is off, the compositor is not rendering, or the session is locked — not that the desktop is black. |
 
 To authorize ScreenShot2 for the bridge's interpreter:
