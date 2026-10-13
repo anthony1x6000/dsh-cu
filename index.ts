@@ -32,6 +32,7 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, realpathSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
@@ -655,6 +656,24 @@ export function validateToolSpecs(validator?: HarnessValidator): string[] {
   return problems
 }
 
+/**
+ * A short fingerprint of the tool schemas this build registers.
+ *
+ * It answers the question "which schemas is the *running* process serving?"
+ * without a debugger: tool schemas travel with every request, so a process that
+ * is still serving an old generation is the difference between chats working
+ * and every turn failing with a provider-side 400. Comparing the fingerprint in
+ * the startup log against this build's own value is the check.
+ *
+ * @returns eight hex characters, stable for a given set of schemas.
+ */
+export function schemaFingerprint(): string {
+  const canonical = TOOL_SPECS
+    .map((spec) => JSON.stringify([spec.suffix, spec.parameters]))
+    .join('\n')
+  return createHash('sha256').update(canonical).digest('hex').slice(0, 8)
+}
+
 /** True when a value is a non-null object. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -1077,7 +1096,7 @@ export async function apply(ctx: PluginContext, config: Config = {}): Promise<vo
   })
 
   const startup = `dsh-cu: registered ${String(disposers.length)} computer-use entries `
-    + `(prefix "${resolved.toolPrefix}", bridge ${launcher})`
+    + `(prefix "${resolved.toolPrefix}", bridge ${launcher}, schemas ${schemaFingerprint()})`
     + (skipped.length > 0 ? `; skipped ${skipped.join(', ')} for invalid schemas` : '')
   ctx.logger?.info(startup)
   // Also on stderr: a host that wires no log sink to `ctx.logger` would

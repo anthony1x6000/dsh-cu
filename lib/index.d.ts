@@ -277,6 +277,18 @@ export declare function loadHarnessValidator(): Promise<HarnessValidator | undef
  * @returns one message per problem across every spec; empty means all are valid.
  */
 export declare function validateToolSpecs(validator?: HarnessValidator): string[];
+/**
+ * A short fingerprint of the tool schemas this build registers.
+ *
+ * It answers the question "which schemas is the *running* process serving?"
+ * without a debugger: tool schemas travel with every request, so a process that
+ * is still serving an old generation is the difference between chats working
+ * and every turn failing with a provider-side 400. Comparing the fingerprint in
+ * the startup log against this build's own value is the check.
+ *
+ * @returns eight hex characters, stable for a given set of schemas.
+ */
+export declare function schemaFingerprint(): string;
 /** Render one bridge result as digestible text, bounded so a tree cannot flood the context. */
 export declare function renderResult(value: unknown, limit?: number): string;
 /** Describe a screenshot result in one line, since the image itself is a file. */

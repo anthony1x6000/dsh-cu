@@ -27,6 +27,7 @@ import {
   loadHarnessValidator,
   structuralSchemaProblems,
   TOOL_SPECS,
+  schemaFingerprint,
   validateToolSpecs,
   type PluginContext,
 } from './index.ts'
@@ -357,6 +358,24 @@ if (harnessValidator?.assertSupportedJsonSchema === undefined) {
     'the harness must accept every shipped schema',
   )
 }
+
+// The fingerprint identifies the schema generation in the startup log, so it
+// must be stable across calls and differ when the schemas do.
+assert.match(schemaFingerprint(), /^[0-9a-f]{8}$/, 'the fingerprint is eight hex characters')
+assert.equal(schemaFingerprint(), schemaFingerprint(), 'the fingerprint is stable')
+assert.notEqual(
+  schemaFingerprint(),
+  (() => {
+    const original = TOOL_SPECS[0].parameters
+    try {
+      TOOL_SPECS[0].parameters = { type: 'object', properties: {}, additionalProperties: false }
+      return schemaFingerprint()
+    } finally {
+      TOOL_SPECS[0].parameters = original
+    }
+  })(),
+  'a different schema set must fingerprint differently',
+)
 
 // --- bridge operation coverage ----------------------------------------------
 
