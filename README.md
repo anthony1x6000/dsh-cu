@@ -328,6 +328,34 @@ Worth knowing if you write another plugin: the harness does **not** validate
 plugin-supplied parameter schemas when they are registered, so nothing catches
 this for you at load time.
 
+### Updating an installed plugin needs a service restart
+
+A plugin installed under the profile's `node_modules` is **not** watched for
+changes, and the harness re-applies the profile patch without invalidating the
+ESM module cache. Reinstalling a new build therefore re-registers the *old* code:
+the startup line keeps describing the previous generation, and the tool schemas
+sent to the provider stay stale — which is fatal, because a stale schema can make
+every turn fail with a provider-side 400 while the files on disk look correct.
+
+The startup line carries a fingerprint of the exact schemas the process is
+serving, so this is checkable instead of guessable:
+
+```
+dsh-cu: registered 14 computer-use entries (prefix "cu_", …, schemas ee6c0b0a)
+```
+
+Compare `schemas <hash>` against the build's own value
+(`node -e "import('./lib/index.js').then(m => console.log(m.schemaFingerprint()))"`).
+If it differs, or the field is missing entirely, the process is serving an older
+generation and needs a restart:
+
+```bash
+systemctl --user restart dsh-web.service   # then reload the GUI page
+```
+
+A `remove` + `add` cycle is not enough on its own; it triggers a reload, but of
+the cached module.
+
 `selfcheck` runs a fake bridge that speaks the same frames, so it needs no
 desktop. `test:integration` drives the real session and is conservative: it
 restores the pointer to where it found it, skips keyboard input while the session
