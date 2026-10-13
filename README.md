@@ -16,6 +16,27 @@ Derived from [kwin-mcp](https://github.com/isac322/kwin-mcp) (MIT,
 Copyright © 2026 Byeonghoon Yoo); that licence is inherited — see
 [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
+## Relationship to kwin-mcp (and why this is not a fork)
+
+dsh-cu reuses kwin-mcp's mechanisms for talking to KWin — the scripting
+transport, the `ScreenShot2` raw-frame capture, the EIS/libei input client, the
+AT-SPI window matching, and the flatpak scope identity — and its `NOTICE` maps
+each module to the upstream file it came from, pinned to **v0.11.0
+(`dfcc4ea50a32`)**. It is not a git fork of kwin-mcp, deliberately:
+
+* it is a **different artifact for a different host** — a DeepSeek Harness
+  plugin with native `cu_*` tools and a JSON-RPC bridge, not an MCP server, and
+  it targets the live desktop only (no `kwin_wayland --virtual` sessions);
+* it does **not track upstream**: the two share mechanisms, not a roadmap, so a
+  fork would advertise a lineage and a merge path that does not exist;
+* MIT requires the copyright and permission notice to travel with the work,
+  which `LICENSE` and `NOTICE` do. It does not require a fork.
+
+If the goal is to give back to the upstream project rather than merely credit
+it, the useful shape is a contribution to kwin-mcp's existing `integrations/`
+directory (which already holds its OpenCode and Claude Code plugins) — not a
+fork of the whole project.
+
 ## What it is good at
 
 | | |

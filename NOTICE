@@ -9,6 +9,23 @@ This project is derived from **kwin-mcp** — <https://github.com/isac322/kwin-m
 licence is inherited by this work, and the corresponding permission notice is
 reproduced in `LICENSE`.
 
+Pinned upstream revision the derivation was taken from:
+
+```
+kwin-mcp v0.11.0 (pyproject.toml)
+commit dfcc4ea50a32 (github.com/isac322/kwin-mcp)
+```
+
+This repository is **not** a git fork of kwin-mcp: it is an independent project
+that reuses the mechanisms below, and it does not track upstream. The upstream
+commit is recorded here so a reader can diff the derivation against its source.
+The measured overlap is real rather than incidental — 25 of the 25 libei
+functions dsh-cu calls are the same ones kwin-mcp declares, the
+`QImage::Format` → Pillow mode table is identical, the evdev keycode table and
+the terminal paste-chord list carry the same values, and the accessibility
+window-matching functions are 67% line-similar — so the attribution is
+mandatory, not a courtesy.
+
 The derivation is a re-implementation in Python and TypeScript of techniques
 and, in places, code that kwin-mcp established for KDE Plasma 6 Wayland:
 
