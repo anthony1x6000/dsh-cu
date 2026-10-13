@@ -301,10 +301,32 @@ mutating ones (`window`, `mouse`, `keyboard`, `a11y_invoke`, `launch`,
 ## Testing
 
 ```bash
-pnpm selfcheck          # tool/registry contract, bridge protocol, packaging, licence
+pnpm selfcheck          # tool/registry contract, schema validity, bridge protocol, packaging, licence
 pnpm test:python        # unit tests for identity, keys, matching, mapping, framing
 pnpm test:integration   # live checks against the running desktop
+python3 tests/validate_schemas.py            # meta-schema check of every tool schema
+python3 tests/validate_schemas.py --session <log.jsonl>   # every tool in a recorded request
 ```
+
+`validate_schemas.py` exists because a malformed tool schema is not a local
+problem: schemas travel with **every** model request, so one bad schema makes
+every turn fail with a provider-side 400 instead of degrading one tool. That
+happened here — `required: true` written inside a property (the `defineTool`
+authoring form) instead of a root `required` array, which the provider answers
+with `True is not of type 'array'`. Two gates now stand in the way:
+
+* `apply()` compiles every parameter spec with `compileParameters()` and
+  validates the result against the harness's own `assertSupportedJsonSchema`
+  (resolved at runtime, like the MCP client) plus built-in structural checks. A
+  spec that fails is **skipped with a loud message** rather than registered, so
+  one bad tool can never take down every request.
+* `selfcheck` runs the same gates, and `validate_schemas.py` checks the shipped
+  schemas against the JSON Schema 2020-12 meta-schema — the validator class the
+  provider uses — optionally over a whole recorded request.
+
+Worth knowing if you write another plugin: the harness does **not** validate
+plugin-supplied parameter schemas when they are registered, so nothing catches
+this for you at load time.
 
 `selfcheck` runs a fake bridge that speaks the same frames, so it needs no
 desktop. `test:integration` drives the real session and is conservative: it
@@ -335,6 +357,7 @@ python/dsh_cu_bridge/
 tools/authorize-screenshot.sh
 tests/test_pure.py           unit tests (identity, keys, matching, mapping, sandbox fallbacks)
 tests/integration.py         live desktop checks, including a read-only-sandbox run
+tests/validate_schemas.py    meta-schema validation of the tool schemas
 ```
 
 The bridge is spawned once (`--serve`) on first tool use and kept resident: the

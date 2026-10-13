@@ -32,9 +32,10 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'computer-use-plasma'
@@ -47,6 +48,9 @@ export const DEFAULT_PYTHON = 'python3'
 
 /** Relative path of the bridge launcher inside this package. */
 export const LAUNCHER_RELATIVE_PATH = 'bin/dsh-cu-bridge'
+
+/** Package specifier of the harness tools module, used only to validate schemas. */
+export const TOOLS_SPECIFIER = '@deepseek-ai/dsh-tools'
 
 /** Default prefix every registered tool name starts with. */
 export const DEFAULT_TOOL_PREFIX = 'cu_'
@@ -480,6 +484,177 @@ interface ToolSpec {
   toPayload?(args: Record<string, unknown>): Record<string, unknown>
 }
 
+/** One author-facing parameter: JSON Schema keywords plus the DSL's `required` flag. */
+export type PropertySpec = Record<string, unknown> & { required?: true }
+
+/**
+ * Compile author-facing parameter specs into raw JSON Schema.
+ *
+ * The distinction this function exists for is easy to get wrong and expensive
+ * when you do: the `defineTool` authoring DSL marks a property required *inside*
+ * the property (`{ type: 'string', required: true }`), while the schema that
+ * actually reaches the model provider is raw JSON Schema, where `required` is an
+ * **array of property names on the object**. Sending the DSL form makes the
+ * provider reject every request — "True is not of type 'array'" — because tool
+ * schemas ship with every call, so one bad schema breaks all of them.
+ *
+ * Nested object properties are written as raw JSON Schema already (their own
+ * `required` arrays are untouched); only the top level of the parameter map uses
+ * the flag.
+ *
+ * @param properties - author-facing parameter specs.
+ * @returns the object-rooted raw schema, with a root `required` array.
+ */
+export function compileParameters(properties: Record<string, PropertySpec>): Record<string, unknown> {
+  const compiled: Record<string, unknown> = {}
+  const required: string[] = []
+  for (const [key, spec] of Object.entries(properties)) {
+    const { required: isRequired, ...rest } = spec
+    if (isRequired === true) required.push(key)
+    compiled[key] = rest
+  }
+  const schema: Record<string, unknown> = {
+    type: 'object',
+    properties: compiled,
+    additionalProperties: false,
+  }
+  if (required.length > 0) schema.required = required
+  return schema
+}
+
+/** JSON Schema types this plugin uses. */
+const ALLOWED_TYPES = new Set(['string', 'number', 'integer', 'boolean', 'null', 'array', 'object'])
+
+/**
+ * Check one parameter schema against the rules that matter for this plugin.
+ *
+ * Dependency-free on purpose: this runs before every registration, so the guard
+ * cannot be missing on a host where the harness's own validator cannot be
+ * resolved. It covers exactly the ways a schema here can be malformed —
+ * property-level `required`, a `required` array naming undeclared properties, an
+ * unsupported `additionalProperties`, an array without `items`, an empty `enum`.
+ *
+ * @param tool - tool name, for the message.
+ * @param schema - the compiled parameter schema.
+ * @returns one message per problem; empty means the schema is well formed.
+ */
+export function structuralSchemaProblems(tool: string, schema: Record<string, unknown>): string[] {
+  const problems: string[] = []
+  if (schema.type !== 'object') problems.push(`${tool}: parameter root must be type "object"`)
+  if (schema.additionalProperties !== false && typeof schema.additionalProperties !== 'boolean') {
+    problems.push(`${tool}: root additionalProperties must be a boolean`)
+  }
+  const properties = schema.properties
+  if (typeof properties !== 'object' || properties === null || Array.isArray(properties)) {
+    problems.push(`${tool}: properties must be an object`)
+    return problems
+  }
+  const declared = new Set(Object.keys(properties as Record<string, unknown>))
+  const required = schema.required
+  if (required !== undefined) {
+    if (!Array.isArray(required) || required.some((entry) => typeof entry !== 'string')) {
+      problems.push(`${tool}: required must be an array of property names, got ${JSON.stringify(required)}`)
+    } else {
+      for (const name of required as string[]) {
+        if (!declared.has(name)) problems.push(`${tool}: required names undeclared property ${name}`)
+      }
+    }
+  }
+  for (const [key, raw] of Object.entries(properties as Record<string, unknown>)) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+      problems.push(`${tool}.${key}: a property must be a schema object`)
+      continue
+    }
+    const property = raw as Record<string, unknown>
+    if ('required' in property) {
+      problems.push(
+        `${tool}.${key}: "required" belongs on the object as an array of names, not inside a property `
+        + `(the provider rejects that with "True is not of type 'array'")`,
+      )
+    }
+    if (typeof property.type !== 'string' || !ALLOWED_TYPES.has(property.type)) {
+      problems.push(`${tool}.${key}: type must be one of ${[...ALLOWED_TYPES].join(', ')}`)
+    }
+    if (property.type === 'array' && typeof property.items !== 'object') {
+      problems.push(`${tool}.${key}: an array needs an items schema`)
+    }
+    if (property.additionalProperties !== undefined && typeof property.additionalProperties !== 'boolean') {
+      problems.push(`${tool}.${key}: additionalProperties must be a boolean`)
+    }
+    if (property.enum !== undefined && (!Array.isArray(property.enum) || property.enum.length === 0)) {
+      problems.push(`${tool}.${key}: enum must be a non-empty array`)
+    }
+  }
+  return problems
+}
+
+/** The harness's own schema validator, when it can be resolved. */
+interface HarnessValidator {
+  assertSupportedJsonSchema?(schema: unknown): void
+}
+
+/**
+ * Resolve the harness's schema validator.
+ *
+ * A linked or installed out-of-tree plugin has no `node_modules` of its own, so
+ * the bare specifier only resolves when the profile happens to provide it; the
+ * fallback resolves the harness's own copy from the running entry point, which
+ * is the same physical module the harness loads. `DSH_CU_TOOLS_ENTRY` overrides
+ * the specifier or absolute path.
+ *
+ * @returns the validator module, or undefined when nothing resolved.
+ */
+export async function loadHarnessValidator(): Promise<HarnessValidator | undefined> {
+  const override = process.env.DSH_CU_TOOLS_ENTRY
+  const specifiers = override !== undefined && override.length > 0
+    ? [override, TOOLS_SPECIFIER]
+    : [TOOLS_SPECIFIER]
+  for (const specifier of specifiers) {
+    try {
+      return (await import(specifier)) as HarnessValidator
+    } catch {
+      // Try the next resolution strategy.
+    }
+  }
+  for (const anchor of [process.argv[1], process.env.DSH_CU_HARNESS_ENTRY]) {
+    if (anchor === undefined || anchor.length === 0) continue
+    try {
+      const require = createRequire(realpathSync(anchor))
+      const resolved = require.resolve(TOOLS_SPECIFIER)
+      return (await import(pathToFileURL(resolved).href)) as HarnessValidator
+    } catch {
+      // Try the next anchor.
+    }
+  }
+  return undefined
+}
+
+/**
+ * Validate every tool spec before anything is registered.
+ *
+ * A malformed parameter schema is not a local problem: tool schemas are sent to
+ * the model provider on **every** request, so one bad schema makes every turn
+ * fail. The harness accepts plugin parameters without checking them, so the
+ * check has to happen here.
+ *
+ * @param validator - the harness validator, when it could be resolved.
+ * @returns one message per problem across every spec; empty means all are valid.
+ */
+export function validateToolSpecs(validator?: HarnessValidator): string[] {
+  const problems: string[] = []
+  for (const spec of TOOL_SPECS) {
+    problems.push(...structuralSchemaProblems(spec.suffix, spec.parameters))
+    if (validator?.assertSupportedJsonSchema !== undefined) {
+      try {
+        validator.assertSupportedJsonSchema(spec.parameters)
+      } catch (error: unknown) {
+        problems.push(`${spec.suffix}: the harness rejects this schema: ${String((error as Error).message ?? error)}`)
+      }
+    }
+  }
+  return problems
+}
+
 /** True when a value is a non-null object. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -537,16 +712,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'geometry, whether input injection (KWin EIS + libei) works, which screenshot backend is authorized, '
       + 'whether toolkit accessibility is on, whether the session is locked, Klipper, and the installed and '
       + 'running flatpak apps. Call this first when a computer-use task starts or after something failed.',
-    parameters: {
-      type: 'object',
-      properties: {
-        refreshScreenshotAuthorization: {
-          type: 'boolean',
-          description: 'Re-probe KWin ScreenShot2 authorization instead of using the cached probe.',
-        },
+    parameters: compileParameters({
+      refreshScreenshotAuthorization: {
+        type: 'boolean',
+        description: 'Re-probe KWin ScreenShot2 authorization instead of using the cached probe.',
       },
-      additionalProperties: false,
-    },
+    }),
   },
   {
     suffix: 'windows',
@@ -558,19 +729,15 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'the KWin window id (used by every other window tool), the app id, the pid, the frame/client/buffer '
       + 'rectangles, and flatpakAppId when the window belongs to a flatpak sandbox. This is the cheapest way '
       + 'to find what to act on, and the only one that sees apps that publish no accessibility tree.',
-    parameters: {
-      type: 'object',
-      properties: {
-        app: { type: 'string', description: 'Case-insensitive substring match on app id, caption, or resource name.' },
-        caption: { type: 'string', description: 'Case-insensitive substring match on the window caption.' },
-        includePopups: { type: 'boolean', description: 'Include popup windows (menus, tooltips). Default true.' },
-        includeSpecial: {
-          type: 'boolean',
-          description: 'Include desktop, dock, and notification windows, which are filtered out by default.',
-        },
+    parameters: compileParameters({
+      app: { type: 'string', description: 'Case-insensitive substring match on app id, caption, or resource name.' },
+      caption: { type: 'string', description: 'Case-insensitive substring match on the window caption.' },
+      includePopups: { type: 'boolean', description: 'Include popup windows (menus, tooltips). Default true.' },
+      includeSpecial: {
+        type: 'boolean',
+        description: 'Include desktop, dock, and notification windows, which are filtered out by default.',
       },
-      additionalProperties: false,
-    },
+    }),
   },
   {
     suffix: 'window',
@@ -584,28 +751,24 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'KWin because AT-SPI focus does not raise windows on Wayland, so activate before typing or clicking '
       + 'when the target may not be focused. Returns the window state before and after, and `refused` when the '
       + 'window does not allow the action.',
-    parameters: {
-      type: 'object',
-      properties: {
-        action: {
-          type: 'string',
-          required: true,
-          enum: ['info', 'activate', 'close', 'minimize', 'maximize', 'fullscreen', 'keep_above', 'on_all_desktops', 'geometry'],
-          description: 'What to do with the window.',
-        },
-        windowId: { type: 'string', description: 'Exact KWin window id, including braces, as reported by cu_windows.' },
-        app: { type: 'string', description: 'App id or caption substring, used when windowId is omitted.' },
-        value: {
-          type: 'boolean',
-          description: 'For minimize/maximize/fullscreen/keep_above/on_all_desktops: desired state. Default true.',
-        },
-        x: { type: 'integer', description: 'For geometry: new frame x in global logical coordinates.' },
-        y: { type: 'integer', description: 'For geometry: new frame y in global logical coordinates.' },
-        width: { type: 'integer', description: 'For geometry: new frame width.' },
-        height: { type: 'integer', description: 'For geometry: new frame height.' },
+    parameters: compileParameters({
+      action: {
+        type: 'string',
+        required: true,
+        enum: ['info', 'activate', 'close', 'minimize', 'maximize', 'fullscreen', 'keep_above', 'on_all_desktops', 'geometry'],
+        description: 'What to do with the window.',
       },
-      additionalProperties: false,
-    },
+      windowId: { type: 'string', description: 'Exact KWin window id, including braces, as reported by cu_windows.' },
+      app: { type: 'string', description: 'App id or caption substring, used when windowId is omitted.' },
+      value: {
+        type: 'boolean',
+        description: 'For minimize/maximize/fullscreen/keep_above/on_all_desktops: desired state. Default true.',
+      },
+      x: { type: 'integer', description: 'For geometry: new frame x in global logical coordinates.' },
+      y: { type: 'integer', description: 'For geometry: new frame y in global logical coordinates.' },
+      width: { type: 'integer', description: 'For geometry: new frame width.' },
+      height: { type: 'integer', description: 'For geometry: new frame height.' },
+    }),
   },
   {
     suffix: 'screenshot',
@@ -618,28 +781,24 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'that cu_mouse takes. Read the saved file with the read_image tool to look at it. Prefers KWin '
       + 'ScreenShot2 and falls back to Spectacle; a uniform single-colour frame is reported as a warning '
       + 'because it means the display is off, the compositor is not rendering, or the session is locked.',
-    parameters: {
-      type: 'object',
-      properties: {
-        target: { type: 'string', enum: ['workspace', 'window', 'area'], description: 'What to capture. Default workspace.' },
-        windowId: { type: 'string', description: 'For target=window: exact KWin window id.' },
-        app: { type: 'string', description: 'For target=window: app id or caption substring instead of windowId.' },
-        x: { type: 'integer', description: 'For target=area: left edge in global logical coordinates.' },
-        y: { type: 'integer', description: 'For target=area: top edge in global logical coordinates.' },
-        width: { type: 'integer', description: 'For target=area: width in logical pixels.' },
-        height: { type: 'integer', description: 'For target=area: height in logical pixels.' },
-        saveTo: { type: 'string', description: 'File or directory to write. Defaults to the plugin screenshot directory.' },
-        maxEdge: { type: 'integer', description: 'Downscale so the longer edge is at most this many pixels; 0 keeps full size.' },
-        includeCursor: { type: 'boolean', description: 'Draw the pointer into the capture.' },
-        backend: {
-          type: 'string',
-          enum: ['auto', 'screenshot2', 'spectacle'],
-          description: 'Force one backend instead of trying ScreenShot2 and falling back to Spectacle.',
-        },
-        refreshAuthorization: { type: 'boolean', description: 'Re-probe ScreenShot2 authorization before capturing.' },
+    parameters: compileParameters({
+      target: { type: 'string', enum: ['workspace', 'window', 'area'], description: 'What to capture. Default workspace.' },
+      windowId: { type: 'string', description: 'For target=window: exact KWin window id.' },
+      app: { type: 'string', description: 'For target=window: app id or caption substring instead of windowId.' },
+      x: { type: 'integer', description: 'For target=area: left edge in global logical coordinates.' },
+      y: { type: 'integer', description: 'For target=area: top edge in global logical coordinates.' },
+      width: { type: 'integer', description: 'For target=area: width in logical pixels.' },
+      height: { type: 'integer', description: 'For target=area: height in logical pixels.' },
+      saveTo: { type: 'string', description: 'File or directory to write. Defaults to the plugin screenshot directory.' },
+      maxEdge: { type: 'integer', description: 'Downscale so the longer edge is at most this many pixels; 0 keeps full size.' },
+      includeCursor: { type: 'boolean', description: 'Draw the pointer into the capture.' },
+      backend: {
+        type: 'string',
+        enum: ['auto', 'screenshot2', 'spectacle'],
+        description: 'Force one backend instead of trying ScreenShot2 and falling back to Spectacle.',
       },
-      additionalProperties: false,
-    },
+      refreshAuthorization: { type: 'boolean', description: 'Re-probe ScreenShot2 authorization before capturing.' },
+    }),
   },
   {
     suffix: 'mouse',
@@ -654,29 +813,25 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'which reads the current pointer position. Injection goes through the compositor, so it reaches '
       + 'Wayland, XWayland, Wine, and flatpak windows alike, but it lands on whichever window has focus: '
       + 'activate the target first.',
-    parameters: {
-      type: 'object',
-      properties: {
-        action: {
-          type: 'string',
-          required: true,
-          enum: ['move', 'click', 'double_click', 'triple_click', 'down', 'up', 'drag', 'scroll', 'position'],
-          description: 'Which pointer gesture to perform.',
-        },
-        x: { type: 'integer', description: 'Target x in global logical coordinates.' },
-        y: { type: 'integer', description: 'Target y in global logical coordinates.' },
-        toX: { type: 'integer', description: 'For drag: end x.' },
-        toY: { type: 'integer', description: 'For drag: end y.' },
-        button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button. Default left.' },
-        clicks: { type: 'integer', description: 'Override the click count for action=click.' },
-        holdMs: { type: 'integer', description: 'Hold the last click this many milliseconds (long press).' },
-        amount: { type: 'integer', description: 'For scroll: wheel steps; positive scrolls up/left, negative down/right.' },
-        horizontal: { type: 'boolean', description: 'For scroll: scroll horizontally instead of vertically.' },
-        discrete: { type: 'boolean', description: 'For scroll: whole detents (default) rather than smooth pixels.' },
-        steps: { type: 'integer', description: 'For drag: intermediate motion steps. Default 20.' },
+    parameters: compileParameters({
+      action: {
+        type: 'string',
+        required: true,
+        enum: ['move', 'click', 'double_click', 'triple_click', 'down', 'up', 'drag', 'scroll', 'position'],
+        description: 'Which pointer gesture to perform.',
       },
-      additionalProperties: false,
-    },
+      x: { type: 'integer', description: 'Target x in global logical coordinates.' },
+      y: { type: 'integer', description: 'Target y in global logical coordinates.' },
+      toX: { type: 'integer', description: 'For drag: end x.' },
+      toY: { type: 'integer', description: 'For drag: end y.' },
+      button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button. Default left.' },
+      clicks: { type: 'integer', description: 'Override the click count for action=click.' },
+      holdMs: { type: 'integer', description: 'Hold the last click this many milliseconds (long press).' },
+      amount: { type: 'integer', description: 'For scroll: wheel steps; positive scrolls up/left, negative down/right.' },
+      horizontal: { type: 'boolean', description: 'For scroll: scroll horizontally instead of vertically.' },
+      discrete: { type: 'boolean', description: 'For scroll: whole detents (default) rather than smooth pixels.' },
+      steps: { type: 'integer', description: 'For drag: intermediate motion steps. Default 20.' },
+    }),
   },
   {
     suffix: 'keyboard',
@@ -690,22 +845,18 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'US-QWERTY keycodes, so for characters outside that layout pass unicode=true, which puts the text on '
       + 'the clipboard and presses the paste chord (refused when the target has no known chord, because a '
       + 'wrong chord injects a literal ^V into a terminal). Activate the target window first.',
-    parameters: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', required: true, enum: ['type', 'press', 'down', 'up'], description: 'What to do.' },
-        text: { type: 'string', description: 'For action=type: the text to type.' },
-        keys: {
-          type: 'string',
-          description: 'For press/down/up: a chord like "ctrl+shift+v", "Return", "F5", or a single character.',
-        },
-        unicode: {
-          type: 'boolean',
-          description: 'For action=type: use the clipboard-paste path even when the text is US-QWERTY typeable.',
-        },
+    parameters: compileParameters({
+      action: { type: 'string', required: true, enum: ['type', 'press', 'down', 'up'], description: 'What to do.' },
+      text: { type: 'string', description: 'For action=type: the text to type.' },
+      keys: {
+        type: 'string',
+        description: 'For press/down/up: a chord like "ctrl+shift+v", "Return", "F5", or a single character.',
       },
-      additionalProperties: false,
-    },
+      unicode: {
+        type: 'boolean',
+        description: 'For action=type: use the clipboard-paste path even when the text is US-QWERTY typeable.',
+      },
+    }),
   },
   {
     suffix: 'a11y_tree',
@@ -719,21 +870,17 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'Prefer cu_a11y_find or cu_windows when you know what you are looking for; this is for exploring. '
       + 'Flutter, Wine, and some Electron apps publish no useful tree — fall back to cu_screenshot plus '
       + 'cu_mouse there.',
-    parameters: {
-      type: 'object',
-      properties: {
-        app: { type: 'string', description: 'Application name substring, for example "Brave" or "Flatseal".' },
-        windowId: { type: 'string', description: 'Restrict the walk to the application owning this KWin window id.' },
-        maxDepth: { type: 'integer', description: 'Maximum tree depth. Default 15.' },
-        role: { type: 'string', description: 'Only return elements with this role, for example "push button".' },
-        maxElements: { type: 'integer', description: 'Cap the returned elements. Default 400.' },
-        ensureEnabled: {
-          type: 'boolean',
-          description: 'Turn toolkit accessibility on when it is off (default true); apps may need a restart to register.',
-        },
+    parameters: compileParameters({
+      app: { type: 'string', description: 'Application name substring, for example "Brave" or "Flatseal".' },
+      windowId: { type: 'string', description: 'Restrict the walk to the application owning this KWin window id.' },
+      maxDepth: { type: 'integer', description: 'Maximum tree depth. Default 15.' },
+      role: { type: 'string', description: 'Only return elements with this role, for example "push button".' },
+      maxElements: { type: 'integer', description: 'Cap the returned elements. Default 400.' },
+      ensureEnabled: {
+        type: 'boolean',
+        description: 'Turn toolkit accessibility on when it is off (default true); apps may need a restart to register.',
       },
-      additionalProperties: false,
-    },
+    }),
   },
   {
     suffix: 'a11y_find',
@@ -745,22 +892,18 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'coordinates and the actions each element supports. This is the reliable way to locate a control to '
       + 'click: pass waitMs to poll while a window finishes opening. Combine with cu_a11y_invoke to act on an '
       + 'element directly instead of clicking coordinates.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Case-insensitive substring of the element name, role, or description. Empty matches everything.' },
-        app: { type: 'string', description: 'Application name substring.' },
-        windowId: { type: 'string', description: 'Restrict the search to the application owning this KWin window id.' },
-        states: {
-          type: 'array',
-          items: { type: 'string' },
-          description: 'Only match elements that have all of these AT-SPI states, for example ["showing", "enabled"].',
-        },
-        waitMs: { type: 'integer', description: 'Poll for up to this long before giving up. Default 0 (one pass).' },
-        maxResults: { type: 'integer', description: 'Cap the returned matches. Default 50.' },
+    parameters: compileParameters({
+      query: { type: 'string', description: 'Case-insensitive substring of the element name, role, or description. Empty matches everything.' },
+      app: { type: 'string', description: 'Application name substring.' },
+      windowId: { type: 'string', description: 'Restrict the search to the application owning this KWin window id.' },
+      states: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Only match elements that have all of these AT-SPI states, for example ["showing", "enabled"].',
       },
-      additionalProperties: false,
-    },
+      waitMs: { type: 'integer', description: 'Poll for up to this long before giving up. Default 0 (one pass).' },
+      maxResults: { type: 'integer', description: 'Cap the returned matches. Default 50.' },
+    }),
   },
   {
     suffix: 'a11y_invoke',
@@ -773,17 +916,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'toggle, or menu item, and the only one that works when the element has no usable coordinates. Refuses '
       + 'when more than one element matches (pass index to choose) or when the subtree cannot be read completely, '
       + 'because acting on the wrong control cannot be undone. Use action="click" for the default action.',
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', required: true, description: 'Element name, role, or description substring identifying the target.' },
-        app: { type: 'string', description: 'Application name substring to search within.' },
-        windowId: { type: 'string', description: 'Restrict the search to the application owning this KWin window id.' },
-        action: { type: 'string', description: 'Exact AT-SPI action name; "click" (the default) picks click/activate/press/toggle.' },
-        index: { type: 'integer', description: 'Pick this match when several match, instead of refusing.' },
-      },
-      additionalProperties: false,
-    },
+    parameters: compileParameters({
+      query: { type: 'string', required: true, description: 'Element name, role, or description substring identifying the target.' },
+      app: { type: 'string', description: 'Application name substring to search within.' },
+      windowId: { type: 'string', description: 'Restrict the search to the application owning this KWin window id.' },
+      action: { type: 'string', description: 'Exact AT-SPI action name; "click" (the default) picks click/activate/press/toggle.' },
+      index: { type: 'integer', description: 'Pick this match when several match, instead of refusing.' },
+    }),
   },
   {
     suffix: 'a11y_windows',
@@ -795,7 +934,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'flatpakAppId. Use it to discover which apps can be driven through accessibility at all, and to see '
       + 'the proxyPid of a flatpak app, whose accessibility tree is published by its sandbox proxy rather than '
       + 'by the app process itself.',
-    parameters: { type: 'object', properties: {}, additionalProperties: false },
+    parameters: compileParameters({}),
   },
   {
     suffix: 'launch',
@@ -809,24 +948,20 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'which is exact even with several instances running. For a host program pass command and args. The '
       + 'wait is part of the call on purpose: polling for a window yourself usually ends up activating whatever '
       + 'was already focused.',
-    parameters: {
-      type: 'object',
-      properties: {
-        appId: { type: 'string', description: 'Flatpak application id to run.' },
-        command: { type: 'string', description: 'Host program to run, when appId is not used.' },
-        args: { type: 'array', items: { type: 'string' }, description: 'Arguments for command, or for the flatpak app.' },
-        env: {
-          type: 'object',
-          additionalProperties: { type: 'string' },
-          description: 'Environment variables for the launched app (flatpak passes these with --env=K=V).',
-        },
-        branch: { type: 'string', description: 'Flatpak branch, for example "stable".' },
-        flatpakCommand: { type: 'string', description: 'Run this command inside the sandbox instead of the app\'s own entry point.' },
-        windowMatch: { type: 'string', description: 'Extra fallback match on app id or caption for the window to wait for.' },
-        waitMs: { type: 'integer', description: 'How long to wait for the window. Default 20000.' },
+    parameters: compileParameters({
+      appId: { type: 'string', description: 'Flatpak application id to run.' },
+      command: { type: 'string', description: 'Host program to run, when appId is not used.' },
+      args: { type: 'array', items: { type: 'string' }, description: 'Arguments for command, or for the flatpak app.' },
+      env: {
+        type: 'object',
+        additionalProperties: true,
+        description: 'Environment variables for the launched app, as string values (flatpak passes them with --env=K=V).',
       },
-      additionalProperties: false,
-    },
+      branch: { type: 'string', description: 'Flatpak branch, for example "stable".' },
+      flatpakCommand: { type: 'string', description: 'Run this command inside the sandbox instead of the app\'s own entry point.' },
+      windowMatch: { type: 'string', description: 'Extra fallback match on app id or caption for the window to wait for.' },
+      waitMs: { type: 'integer', description: 'How long to wait for the window. Default 20000.' },
+    }),
   },
   {
     suffix: 'flatpak',
@@ -839,13 +974,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       + 'its running instances with pids and cgroup scopes, and the current accessibility bus state. Use this '
       + 'when a flatpak app cannot be inspected or driven, to see whether the sandbox or accessibility is the '
       + 'obstacle.',
-    parameters: {
-      type: 'object',
-      properties: {
-        appId: { type: 'string', description: 'Describe this one app instead of listing everything.' },
-      },
-      additionalProperties: false,
-    },
+    parameters: compileParameters({
+      appId: { type: 'string', description: 'Describe this one app instead of listing everything.' },
+    }),
   },
   {
     suffix: 'clipboard',
@@ -856,14 +987,10 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     description:
       'Read or write the clipboard through Plasma\'s Klipper. Writing is the escape hatch for getting text '
       + 'into an app when typing it is impractical, and reading is how you capture what a user copied.',
-    parameters: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', required: true, enum: ['read', 'write'], description: 'Read the clipboard or replace it.' },
-        text: { type: 'string', description: 'For action=write: the text to place on the clipboard.' },
-      },
-      additionalProperties: false,
-    },
+    parameters: compileParameters({
+      action: { type: 'string', required: true, enum: ['read', 'write'], description: 'Read the clipboard or replace it.' },
+      text: { type: 'string', description: 'For action=write: the text to place on the clipboard.' },
+    }),
   },
 ]
 
@@ -901,21 +1028,45 @@ export function buildDefinition(spec: ToolSpec, client: BridgeClient, prefix: st
 
 /**
  * Register the computer-use tool surface.
+ *
+ * Every schema is validated before anything is registered. Tool schemas travel
+ * with every model request, so an invalid one does not degrade this plugin — it
+ * makes **every** turn fail with a provider-side 400. A spec that fails
+ * validation is therefore skipped with a loud message instead of being
+ * registered, which keeps the rest of the harness usable.
+ *
+ * Returning nothing is deliberate: an async plugin entry point may only resolve
+ * to an effect, and a count is not one (Cordis rejects it with "Invalid effect").
+ *
  * @param ctx - plugin context; `ctx.tools` must be mounted.
  * @param config - optional plugin configuration.
- * @returns how many tools were registered.
  */
-export function apply(ctx: PluginContext, config: Config = {}): number {
+export async function apply(ctx: PluginContext, config: Config = {}): Promise<void> {
   const resolved = resolveConfig(config)
   const launcher = launcherPath(resolved)
   const client = new BridgeClient(resolved, launcher)
   const disposers: Array<() => void> = []
 
+  const validator = await loadHarnessValidator()
+  if (validator?.assertSupportedJsonSchema === undefined) {
+    console.error(
+      'dsh-cu: the harness schema validator could not be resolved; falling back to the built-in '
+      + 'structural checks only. Set DSH_CU_TOOLS_ENTRY to @deepseek-ai/dsh-tools if this persists.',
+    )
+  }
+  const problems = validateToolSpecs(validator)
+  const broken = new Set(problems.map((problem) => problem.split(':')[0] ?? ''))
+  if (problems.length > 0) {
+    for (const problem of problems) console.error(`dsh-cu: refusing to register a tool with an invalid schema — ${problem}`)
+  }
+
   for (const spec of TOOL_SPECS) {
+    if (broken.has(spec.suffix)) continue
     if (spec.mutating === true && !resolved.enableInput) continue
     const definition = buildDefinition(spec, client, resolved.toolPrefix, resolved.launchTimeoutMs)
     disposers.push(ctx.tools.register(definition))
   }
+  const skipped = TOOL_SPECS.filter((spec) => broken.has(spec.suffix)).map((spec) => spec.suffix)
 
   const skill = resolved.enableSkill ? skillRegistration(ctx, resolved) : undefined
   if (skill !== undefined) disposers.push(skill)
@@ -927,11 +1078,11 @@ export function apply(ctx: PluginContext, config: Config = {}): number {
 
   const startup = `dsh-cu: registered ${String(disposers.length)} computer-use entries `
     + `(prefix "${resolved.toolPrefix}", bridge ${launcher})`
+    + (skipped.length > 0 ? `; skipped ${skipped.join(', ')} for invalid schemas` : '')
   ctx.logger?.info(startup)
   // Also on stderr: a host that wires no log sink to `ctx.logger` would
   // otherwise swallow the only evidence that the tools mounted.
   console.error(startup)
-  return disposers.length
 }
 
 /** The skill body: the loop that keeps an agent out of the usual traps. */

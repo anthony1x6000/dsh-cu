@@ -14,6 +14,7 @@ import { join } from 'node:path'
 
 import {
   apply,
+  compileParameters,
   BridgeClient,
   buildDefinition,
   findPackageRoot,
@@ -23,7 +24,10 @@ import {
   renderResult,
   renderScreenshot,
   resolveConfig,
+  loadHarnessValidator,
+  structuralSchemaProblems,
   TOOL_SPECS,
+  validateToolSpecs,
   type PluginContext,
 } from './index.ts'
 
@@ -192,19 +196,18 @@ function fakeContext(): { ctx: PluginContext, registered: Registered[], order: s
 }
 
 const full = fakeContext()
-const count = apply(full.ctx, {})
-assert.equal(count, TOOL_SPECS.length + 1, 'every tool plus the skill is registered')
+await apply(full.ctx, {})
 assert.equal(full.registered.length, TOOL_SPECS.length)
 assert.ok(full.registered.every((tool) => tool.name.startsWith('cu_')))
 assert.ok(full.order.includes('skill:plasma-computer-use'))
 
 const readOnly = fakeContext()
-apply(readOnly.ctx, { enableInput: false, enableSkill: false })
+await apply(readOnly.ctx, { enableInput: false, enableSkill: false })
 assert.equal(readOnly.registered.length, TOOL_SPECS.length - mutating.length)
 assert.ok(readOnly.registered.every((tool) => !mutating.includes(tool.name.replace('cu_', ''))))
 
 const prefixed = fakeContext()
-apply(prefixed.ctx, { toolPrefix: 'desk_', enableSkill: false })
+await apply(prefixed.ctx, { toolPrefix: 'desk_', enableSkill: false })
 assert.ok(prefixed.registered.some((tool) => tool.name === 'desk_mouse'))
 
 // --- bridge protocol against a fake launcher ---------------------------------
@@ -281,6 +284,79 @@ await assert.rejects(
 
 await fakeClient.dispose()
 assert.equal(fakeClient.running, false)
+
+// --- tool schema validity ----------------------------------------------------
+
+// Tool schemas travel with every model request, so an invalid one breaks every
+// turn with a provider-side 400 rather than one tool. This is the gate for the
+// bug that did exactly that: `required: true` written inside a property (the
+// defineTool authoring form) instead of a root `required` array, which the
+// provider answers with `True is not of type 'array'`.
+const compiled = compileParameters({
+  action: { type: 'string', required: true, enum: ['a', 'b'] },
+  note: { type: 'string' },
+})
+assert.deepEqual(compiled, {
+  type: 'object',
+  properties: { action: { type: 'string', enum: ['a', 'b'] }, note: { type: 'string' } },
+  required: ['action'],
+  additionalProperties: false,
+}, 'compileParameters must lift the DSL flag into the object-level required array')
+assert.deepEqual(compileParameters({}), { type: 'object', properties: {}, additionalProperties: false })
+
+// The guard has to catch the exact shape that caused the outage.
+const poisoned = {
+  type: 'object',
+  properties: { action: { type: 'string', required: true } },
+  additionalProperties: false,
+} as Record<string, unknown>
+const poisonedProblems = structuralSchemaProblems('poisoned', poisoned)
+assert.ok(
+  poisonedProblems.some((problem) => problem.includes('required')),
+  'a property-level required must be reported',
+)
+assert.ok(
+  structuralSchemaProblems('ok', compiled).length === 0,
+  'a correctly compiled schema must pass',
+)
+assert.ok(
+  structuralSchemaProblems('bad', { type: 'object', properties: { x: { type: 'string' } }, required: 'x' }).length > 0,
+  'a non-array required must be reported',
+)
+assert.ok(
+  structuralSchemaProblems('bad', { type: 'object', properties: { x: { type: 'object', additionalProperties: { type: 'string' } } } }).length > 0,
+  'a schema-valued additionalProperties must be reported (the harness subset requires a boolean)',
+)
+assert.ok(
+  structuralSchemaProblems('bad', { type: 'object', properties: { x: { type: 'array' } } }).length > 0,
+  'an array without items must be reported',
+)
+
+// Every shipped spec must be structurally valid...
+assert.deepEqual(validateToolSpecs(), [], 'every shipped tool schema must be structurally valid')
+for (const spec of TOOL_SPECS) {
+  const schema = spec.parameters as { required?: unknown }
+  assert.ok(
+    schema.required === undefined || Array.isArray(schema.required),
+    `${spec.suffix}: required must be an array or absent`,
+  )
+  for (const [key, property] of Object.entries((spec.parameters as { properties: Record<string, object> }).properties)) {
+    assert.ok(!('required' in property), `${spec.suffix}.${key}: required must not sit inside a property`)
+  }
+}
+
+// ...and valid for the harness's own validator, which is what the registry
+// applies to arguments (and which the plugin runs before registering).
+const harnessValidator = await loadHarnessValidator()
+if (harnessValidator?.assertSupportedJsonSchema === undefined) {
+  console.error('dsh-cu selfcheck: the harness validator was not resolvable; ran the structural gate only')
+} else {
+  assert.deepEqual(
+    validateToolSpecs(harnessValidator),
+    [],
+    'the harness must accept every shipped schema',
+  )
+}
 
 // --- bridge operation coverage ----------------------------------------------
 
