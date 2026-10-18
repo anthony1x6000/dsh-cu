@@ -26,7 +26,7 @@
 # that matters.
 set -euo pipefail
 
-PROG=authize-screenshot
+PROG=authorize-screenshot
 DESKTOP_NAME=dsh-cu-bridge.desktop
 TARGET_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 TARGET="$TARGET_DIR/$DESKTOP_NAME"

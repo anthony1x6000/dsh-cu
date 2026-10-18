@@ -1181,6 +1181,10 @@ function skillRegistration(ctx: PluginContext, config: ResolvedConfig): (() => v
     whenToUse:
       'Use for any request to operate the Linux desktop: open or drive a GUI app, click or type into one, '
       + 'take a screenshot, inspect a window or its widgets, or work with a flatpak app.',
+    // The skill registry loads a runtime skill only when it carries an origin
+    // bucket; omitting `source` registers fine and then fails on every load
+    // with 'loaded skill "plasma-computer-use" source must be a string'.
+    source: 'bundled',
     content: SKILL_CONTENT,
     invocation: { modelInvocable: true, userInvocable: true },
   })
