@@ -28,10 +28,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import atspi, clipboard, eis, flatpak, keys, kwin, rpc, shot, status
+from . import atspi, clipboard, eis, flatpak, keys, kwin, rpc, shot, status, wait
 from .rpc import BridgeError
 
 OPS: dict[str, Callable[[dict[str, Any]], Any]] = {}
+
+#: Wait budget used when a caller asks to wait for a window but names none: long
+#: enough for a cold application start, short enough that a typo in the match
+#: string fails the call instead of hanging it.
+DEFAULT_WAIT_MS = 15_000
 
 
 def op(name: str) -> Callable[[Callable[[dict[str, Any]], Any]], Callable[[dict[str, Any]], Any]]:
@@ -78,24 +83,68 @@ def op_status(args: dict[str, Any]) -> dict[str, Any]:
     return status.probe(refresh_screenshot_authorization=_bool(args, "refreshScreenshotAuthorization"))
 
 
+def _window_matches(
+    window: dict[str, Any], *, app: str = "", caption: str = "", text: str = ""
+) -> bool:
+    """Whether one window satisfies every substring filter it was given."""
+    haystack = f"{window['app']} {window['caption']} {window['resourceName']}".lower()
+    if app and app.lower() not in haystack:
+        return False
+    if caption and caption.lower() not in window["caption"].lower():
+        return False
+    if text and text.lower() not in haystack:
+        return False
+    return True
+
+
+def _await_window(wait_for: str, app: str, timeout_ms: int) -> float:
+    """Block until a window matching the filters exists; return the wait in seconds.
+
+    Waiting here is the point: a caller that polls for itself spends a round trip
+    per attempt to learn one fact, while this returns the moment the window
+    appears.
+    """
+    budget_ms = timeout_ms if timeout_ms > 0 else DEFAULT_WAIT_MS
+    windows, waited_s = wait.poll_until(
+        kwin.windows,
+        lambda found: any(_window_matches(w, app=app, text=wait_for) for w in found),
+        budget_ms / 1000.0,
+    )
+    if not any(_window_matches(w, app=app, text=wait_for) for w in windows):
+        raise BridgeError(
+            f"no window matching {wait_for!r} appeared within {budget_ms} ms", "WINDOW_TIMEOUT"
+        )
+    return waited_s
+
+
 @op("window.list")
 def op_window_list(args: dict[str, Any]) -> dict[str, Any]:
-    """List windows, optionally filtered, each enriched with its flatpak app id."""
+    """List windows, optionally filtered, each enriched with its flatpak app id.
+
+    ``waitFor`` holds the call open until a window matches the filters, so
+    waiting for an application to start is one call instead of a poll loop.
+    """
     app = _str(args, "app")
     caption = _str(args, "caption")
+    wait_for = _str(args, "waitFor")
+    timeout_ms = _int(args, "timeoutMs", 0)
     include_popups = _bool(args, "includePopups", True)
     include_special = _bool(args, "includeSpecial", False)
+
+    def wanted(window: dict[str, Any]) -> bool:
+        if not include_popups and window["kind"] == "popup":
+            return False
+        if not include_special and window["kind"] in ("desktop", "dock", "notification"):
+            return False
+        return _window_matches(window, app=app, caption=caption, text=wait_for)
+
+    waited_s = 0.0
+    if wait_for:
+        waited_s = _await_window(wait_for, app, timeout_ms)
     windows = kwin.windows()
     selected: list[dict[str, Any]] = []
     for window in windows:
-        if not include_popups and window["kind"] == "popup":
-            continue
-        if not include_special and window["kind"] in ("desktop", "dock", "notification"):
-            continue
-        haystack = f"{window['app']} {window['caption']} {window['resourceName']}".lower()
-        if app and app.lower() not in haystack:
-            continue
-        if caption and caption.lower() not in window["caption"].lower():
+        if not wanted(window):
             continue
         enriched = dict(window)
         enriched["flatpakAppId"] = flatpak.app_id_for_pid(int(window["pid"]))
@@ -104,7 +153,7 @@ def op_window_list(args: dict[str, Any]) -> dict[str, Any]:
         topology = kwin.outputs()
     except BridgeError:
         topology = None
-    return {
+    result = {
         "windows": selected,
         "count": len(selected),
         "totalWindows": len(windows),
@@ -112,6 +161,9 @@ def op_window_list(args: dict[str, Any]) -> dict[str, Any]:
         "outputs": topology["screens"] if topology else None,
         "activeWindowId": next((w["id"] for w in windows if w["active"]), None),
     }
+    if wait_for:
+        result["waitedMs"] = wait.millis(waited_s)
+    return result
 
 
 @op("window.control")
@@ -160,8 +212,16 @@ def op_pointer_position(args: dict[str, Any]) -> dict[str, Any]:
 
 @op("screenshot")
 def op_screenshot(args: dict[str, Any]) -> dict[str, Any]:
-    """Capture the workspace, one window, or one area."""
+    """Capture the workspace, one window, or one area.
+
+    ``waitFor`` waits for a matching window before capturing anything, which is
+    the "screenshot the app once it is up" call: it cannot capture the wrong
+    frame, and it costs one call rather than a poll loop.
+    """
     target = _str(args, "target", "workspace")
+    wait_for = _str(args, "waitFor")
+    if wait_for:
+        _await_window(wait_for, _str(args, "app"), _int(args, "timeoutMs", 0))
     common = {
         "save_to": args.get("saveTo"),
         "max_edge": _int(args, "maxEdge", 0),
@@ -623,7 +683,12 @@ def op_shutdown(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def dispatch(request: dict[str, Any]) -> dict[str, Any]:
-    """Run one request object and return its response frame."""
+    """Run one request object and return its response frame.
+
+    The frame carries its own cost as ``elapsedMs``: a caller that wonders where
+    a session's wall clock went can read it per operation, and one that does not
+    ignores it.
+    """
     request_id = request.get("id")
     name = request.get("op")
     handler = OPS.get(str(name))
@@ -632,10 +697,13 @@ def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     args = request.get("args") or {}
     if not isinstance(args, dict):
         return rpc.failure(request_id, BridgeError("args must be an object", "BAD_ARGUMENT"))
+    started = time.monotonic()
     try:
-        return rpc.ok(request_id, handler(args))
+        frame = rpc.ok(request_id, handler(args))
     except BaseException as exc:  # noqa: BLE001 - every failure is a frame, never a crash
-        return rpc.failure(request_id, exc)
+        frame = rpc.failure(request_id, exc)
+    frame["elapsedMs"] = wait.millis(time.monotonic() - started)
+    return frame
 
 
 def serve() -> int:
