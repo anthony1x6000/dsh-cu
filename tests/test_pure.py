@@ -19,7 +19,95 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-from dsh_cu_bridge import atspi, flatpak, keys, kwin, rpc, session, shot  # noqa: E402
+from dsh_cu_bridge import atspi, flatpak, keys, kwin, rpc, session, shot, wait  # noqa: E402
+
+
+def _window_matches(window: dict, **filters: str) -> bool:
+    """The bridge's window filter; imported lazily to skip mounting the ops."""
+    from dsh_cu_bridge.__main__ import _window_matches as matches
+
+    return matches(window, **filters)
+
+
+class PollUntilTests(unittest.TestCase):
+    """Waiting is a budget, not a fixed sleep: it must stop the moment it can."""
+
+    @staticmethod
+    def _clock(*times: float):
+        remaining = list(times)
+        return lambda: remaining.pop(0) if remaining else times[-1]
+
+    def test_a_ready_first_probe_never_sleeps(self) -> None:
+        slept: list[float] = []
+        value, elapsed = wait.poll_until(
+            lambda: "here",
+            lambda seen: seen == "here",
+            10.0,
+            clock=self._clock(0.0, 0.5),
+            sleep=slept.append,
+        )
+        self.assertEqual(value, "here")
+        self.assertEqual(slept, [])
+        self.assertAlmostEqual(elapsed, 0.5)
+
+    def test_it_keeps_probing_until_the_value_is_ready(self) -> None:
+        seen = iter(["", "", "ready"])
+        slept: list[float] = []
+        value, _ = wait.poll_until(
+            lambda: next(seen),
+            lambda candidate: candidate == "ready",
+            10.0,
+            interval_s=0.2,
+            clock=self._clock(0.0, 0.1, 0.3, 0.4),
+            sleep=slept.append,
+        )
+        self.assertEqual(value, "ready")
+        self.assertEqual(slept, [0.2, 0.2])
+
+    def test_a_zero_timeout_probes_once(self) -> None:
+        calls: list[int] = []
+
+        def probe() -> int:
+            calls.append(1)
+            return len(calls)
+
+        value, _ = wait.poll_until(probe, lambda _: False, 0.0, clock=self._clock(0.0, 1.0))
+        self.assertEqual(value, 1)
+        self.assertEqual(len(calls), 1)
+
+    def test_the_sleep_never_runs_past_the_deadline(self) -> None:
+        slept: list[float] = []
+        wait.poll_until(
+            lambda: False,
+            lambda _: False,
+            0.3,
+            interval_s=5.0,
+            clock=self._clock(0.0, 0.1, 0.4),
+            sleep=slept.append,
+        )
+        self.assertEqual(len(slept), 1)
+        self.assertLessEqual(slept[0], 0.3)
+
+
+class WindowMatchTests(unittest.TestCase):
+    """The wait filter must match what the listing keeps, or a wait never ends."""
+
+    window = {
+        "app": "org.prismlauncher.PrismLauncher",
+        "caption": "Minecraft 1.12.2",
+        "resourceName": "Minecraft",
+    }
+
+    def test_app_caption_and_text_match_case_insensitively(self) -> None:
+        self.assertTrue(_window_matches(self.window, app="prism"))
+        self.assertTrue(_window_matches(self.window, caption="minecraft 1.12"))
+        self.assertTrue(_window_matches(self.window, text="1.12.2"))
+
+    def test_a_non_match_is_rejected(self) -> None:
+        self.assertFalse(_window_matches(self.window, text="firefox"))
+
+    def test_no_filters_accepts_every_window(self) -> None:
+        self.assertTrue(_window_matches(self.window))
 
 
 class FlatpakScopeTests(unittest.TestCase):
