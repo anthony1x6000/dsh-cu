@@ -228,6 +228,7 @@ def op_screenshot(args: dict[str, Any]) -> dict[str, Any]:
         "include_cursor": _bool(args, "includeCursor"),
         "backend": _str(args, "backend", "auto"),
         "refresh_authorization": _bool(args, "refreshAuthorization"),
+        "image_format": _str(args, "format", "jpeg"),
     }
     if target == "workspace":
         return shot.capture_workspace(**common)

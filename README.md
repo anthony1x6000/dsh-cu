@@ -93,7 +93,7 @@ file:
 | `cu_status` | Capability report: KWin and output geometry, input injection, screenshot backends and authorization, accessibility bus, lock state, whether the caller is sandboxed, Klipper, installed and running flatpak apps, plus an actionable hint per degraded part. |
 | `cu_windows` | Windows from KWin with exact geometry, ids, pids, and `flatpakAppId`. The only view that also sees apps publishing no accessibility tree. |
 | `cu_window` | `info`, `activate`, `close`, `minimize`, `maximize`, `fullscreen`, `keep_above`, `on_all_desktops`, `geometry`. Reports state before/after and `refused` when the window disallows it. |
-| `cu_screenshot` | Workspace, one window, or one area → PNG, with the logical origin/size and a coordinate note. Flags a uniform frame and a locked session. |
+| `cu_screenshot` | Workspace, one window, or one area → JPEG by default (`format: "png"` for exact pixels), with the logical origin/size and a coordinate note. Flags a uniform frame and a locked session. |
 | `cu_mouse` | `move`, `click`, `double_click`, `triple_click`, `down`, `up`, `drag`, `scroll`, `position` — global logical coordinates. |
 | `cu_keyboard` | `type` (US-QWERTY keycodes, or clipboard paste with `unicode: true`), `press`/`hold`/`down`/`up` chords like `ctrl+alt+t`, and `release_all`. |
 | `cu_a11y_tree` | AT-SPI tree with rectangles translated to global coordinates, per element `unavailable` reasons. |

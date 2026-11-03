@@ -315,7 +315,19 @@ def _screenshot_dir() -> Path:
     return session.state_dir() / "screenshots"
 
 
-def _target_path(save_to: str | None, kind: str) -> Path:
+_EXTENSION = {"jpeg": ".jpg", "png": ".png"}
+_JPEG_QUALITY = 85
+
+
+def _save(image: Any, path: Path) -> None:
+    """Encode by extension: PNG costs ~70 ms for a 1080p frame, JPEG ~4 ms."""
+    if path.suffix.lower() in (".jpg", ".jpeg"):
+        image.convert("RGB").save(path, "JPEG", quality=_JPEG_QUALITY)
+    else:
+        image.save(path, "PNG")
+
+
+def _target_path(save_to: str | None, kind: str, image_format: str = "jpeg") -> Path:
     """Resolve the output path for one capture, creating its directory.
 
     An explicit destination is honoured and fails loudly when it cannot be
@@ -323,10 +335,12 @@ def _target_path(save_to: str | None, kind: str) -> Path:
     the state directory is unusable, which is the case when the caller runs
     inside a read-only sandbox and named no destination.
     """
+    if image_format not in _EXTENSION:
+        raise BridgeError(f"format must be one of {sorted(_EXTENSION)}, got {image_format!r}", "BAD_ARGUMENT")
     if save_to:
         path = Path(save_to).expanduser()
         if path.is_dir():
-            path = path / f"dsh-cu-{kind}-{int(time.time())}.png"
+            path = path / f"dsh-cu-{kind}-{int(time.time())}{_EXTENSION[image_format]}"
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -336,7 +350,7 @@ def _target_path(save_to: str | None, kind: str) -> Path:
     if not session.writable(directory):
         directory = Path(tempfile.gettempdir()) / "dsh-cu-screenshots"
         directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"dsh-cu-{kind}-{int(time.time() * 1000)}.png"
+    return directory / f"dsh-cu-{kind}-{int(time.time() * 1000)}{_EXTENSION[image_format]}"
 
 
 def _uniform_colour(image: Any) -> tuple[int, int, int] | None:
@@ -384,7 +398,7 @@ def _finalize(
         target = (max(1, round(image.width * ratio)), max(1, round(image.height * ratio)))
         image = image.resize(target, PilImage.LANCZOS)
     try:
-        image.save(path, "PNG")
+        _save(image, path)
     except OSError as exc:
         raise BridgeError(f"cannot write {path}: {exc}", "SCREENSHOT_WRITE_FAILED") from exc
     result: dict[str, Any] = {
@@ -426,9 +440,10 @@ def capture_workspace(
     include_cursor: bool = False,
     backend: str = "auto",
     refresh_authorization: bool = False,
+    image_format: str = "jpeg",
 ) -> dict[str, Any]:
     """Capture the whole logical workspace."""
-    path = _target_path(save_to, "workspace")
+    path = _target_path(save_to, "workspace", image_format)
     topology = _workspace_geometry()
     virtual = topology["virtual"]
     if backend in ("auto", "screenshot2"):
@@ -481,6 +496,7 @@ def capture_window(
     include_cursor: bool = False,
     backend: str = "auto",
     refresh_authorization: bool = False,
+    image_format: str = "jpeg",
 ) -> dict[str, Any]:
     """Capture one window, including its decoration.
 
@@ -490,7 +506,7 @@ def capture_window(
     state either way.
     """
     window = kwin.require_window(window_id=window_id, app=app)
-    path = _target_path(save_to, "window")
+    path = _target_path(save_to, "window", image_format)
     if backend in ("auto", "screenshot2"):
         available, detail = screenshot2_status(refresh=refresh_authorization)
         if available:
@@ -568,11 +584,12 @@ def capture_area(
     include_cursor: bool = False,
     backend: str = "auto",
     refresh_authorization: bool = False,
+    image_format: str = "jpeg",
 ) -> dict[str, Any]:
     """Capture one logical rectangle of the workspace."""
     if width <= 0 or height <= 0:
         raise BridgeError("area width and height must be positive", "BAD_ARGUMENT")
-    path = _target_path(save_to, "area")
+    path = _target_path(save_to, "area", image_format)
     topology = _workspace_geometry()
     virtual = topology["virtual"]
     if not (
