@@ -95,7 +95,7 @@ file:
 | `cu_window` | `info`, `activate`, `close`, `minimize`, `maximize`, `fullscreen`, `keep_above`, `on_all_desktops`, `geometry`. Reports state before/after and `refused` when the window disallows it. |
 | `cu_screenshot` | Workspace, one window, or one area → PNG, with the logical origin/size and a coordinate note. Flags a uniform frame and a locked session. |
 | `cu_mouse` | `move`, `click`, `double_click`, `triple_click`, `down`, `up`, `drag`, `scroll`, `position` — global logical coordinates. |
-| `cu_keyboard` | `type` (US-QWERTY keycodes, or clipboard paste with `unicode: true`), `press`/`down`/`up` chords like `ctrl+alt+t`. |
+| `cu_keyboard` | `type` (US-QWERTY keycodes, or clipboard paste with `unicode: true`), `press`/`hold`/`down`/`up` chords like `ctrl+alt+t`, and `release_all`. |
 | `cu_a11y_tree` | AT-SPI tree with rectangles translated to global coordinates, per element `unavailable` reasons. |
 | `cu_a11y_find` | Search by name/role/description and required states, with `waitMs` polling. |
 | `cu_a11y_invoke` | Run one accessibility action on exactly one match — the reliable way to press a control. Refuses ambiguity. |
@@ -199,6 +199,23 @@ cu_screenshot { target: "window", windowId }        → 1024x768 at logical (448
 cu_window { action: "close" }                       → closed
 cu_launch { appId: "com.github.tchx84.Flatseal" }   → alreadyRunning true, same window returned
 ```
+
+## Held input is a lease, not a latch
+
+A model reasons for seconds between "press D" and "release D", and the game
+keeps walking the whole time. So held input never depends on the model being
+quick, following the rule in
+[vercel-labs/agent-desktop](https://github.com/vercel-labs/agent-desktop) that a
+held key is refused unless something can release it:
+
+* `cu_keyboard hold` (`keys`, `holdMs`) presses, waits inside the bridge, and
+  releases in one call. `wait: false` returns at once and lets the bridge
+  release on time, so the agent can screenshot while the key is down.
+* `down` (keyboard or mouse) carries a lease, `leaseMs`, default 1000, max
+  30000. A watchdog thread releases it when it runs out. A later `up` reports
+  `was: held`, `expired` or `unheld`, so the agent learns it was too slow.
+* `release_all` frees everything, and the bridge does the same when its session
+  ends, so nothing outlives the process that held it.
 
 ## Input
 

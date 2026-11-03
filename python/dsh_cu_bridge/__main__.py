@@ -289,7 +289,10 @@ def op_mouse(args: dict[str, Any]) -> dict[str, Any]:
         )
     elif action == "down":
         session.button_down(
-            _int(args, "x"), _int(args, "y"), button=_str(args, "button", "left")
+            _int(args, "x"),
+            _int(args, "y"),
+            button=_str(args, "button", "left"),
+            lease_s=_lease_s(args),
         )
     elif action == "up":
         session.button_up(
@@ -339,20 +342,35 @@ def op_keyboard(args: dict[str, Any]) -> dict[str, Any]:
                 if exc.code != "NOT_TYPEABLE":
                     raise
         return _type_via_clipboard(session, text)
+    if action == "release_all":
+        released = session.release_all()
+        return {"action": action, "released": [{"kind": kind, "code": code} for kind, code in released]}
     chord = _str(args, "keys")
     modifiers, main = keys.parse_chord(chord)
+    result: dict[str, Any] = {"action": action, "method": "keys", "keys": chord}
     if action == "press":
         session.press_chord(modifiers, main)
     elif action == "down":
-        session.key_down(modifiers, main)
+        result["leaseMs"] = round(session.key_down(modifiers, main, _lease_s(args)) * 1000)
     elif action == "up":
-        session.key_up(modifiers, main)
+        result["was"] = session.key_up(modifiers, main)
+    elif action == "hold":
+        hold_s = _int(args, "holdMs", 0) / 1000.0
+        if hold_s <= 0:
+            raise BridgeError("keyboard hold needs holdMs greater than 0", "BAD_ARGUMENT")
+        session.hold_key(modifiers, main, hold_s, wait=_bool(args, "wait", True))
+        result["holdMs"] = _int(args, "holdMs")
     else:
         raise BridgeError(
-            f"unknown keyboard action {action!r}; expected type, press, down, or up",
+            f"unknown keyboard action {action!r}; expected type, press, down, up, hold, or release_all",
             "BAD_ARGUMENT",
         )
-    return {"action": action, "method": "keys", "keys": chord}
+    return result
+
+
+def _lease_s(args: dict[str, Any]) -> float | None:
+    """The caller's ``leaseMs`` in seconds, or None for the default lease."""
+    return _int(args, "leaseMs") / 1000.0 if "leaseMs" in args else None
 
 
 def _type_via_clipboard(session: eis.Input, text: str) -> dict[str, Any]:
@@ -715,6 +733,15 @@ def serve() -> int:
     # would otherwise be interleaved into the frame stream.
     responses = os.fdopen(os.dup(sys.stdout.fileno()), "w", encoding="utf-8")
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    try:
+        _serve_requests(responses)
+    finally:
+        # Whatever ended the session, nothing stays held on the desktop.
+        eis.shutdown()
+    return 0
+
+
+def _serve_requests(responses: Any) -> int:
     for line in sys.stdin:
         stripped = line.strip()
         if stripped == "":
