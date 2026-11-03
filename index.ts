@@ -868,6 +868,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button. Default left.' },
       clicks: { type: 'integer', description: 'Override the click count for action=click.' },
       holdMs: { type: 'integer', description: 'Hold the last click this many milliseconds (long press).' },
+      leaseMs: { type: 'integer', description: 'For down: auto-release the button after this many ms. Default 1000, max 30000.' },
       amount: { type: 'integer', description: 'For scroll: wheel steps; positive scrolls up/left, negative down/right.' },
       horizontal: { type: 'boolean', description: 'For scroll: scroll horizontally instead of vertically.' },
       discrete: { type: 'boolean', description: 'For scroll: whole detents (default) rather than smooth pixels.' },
@@ -882,16 +883,28 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     timeoutMs: 120_000,
     description:
       'Type text or press key chords on the focused window. action=type types literal text; action=press '
-      + 'taps a chord such as "ctrl+alt+t" or "Return"; down/up hold and release one. Text is typed as '
+      + 'taps a chord such as "ctrl+alt+t" or "Return"; hold keeps one down for holdMs and releases it itself, '
+      + 'so prefer it for movement keys (hold "d" 300ms) over down/up. down is a lease, not a latch: the bridge '
+      + 'releases it after leaseMs (default 1000, max 30000) even if you never send up, because a model is too '
+      + 'slow to be trusted with a key that must come back on time. release_all frees everything held. Text is typed as '
       + 'US-QWERTY keycodes, so for characters outside that layout pass unicode=true, which puts the text on '
       + 'the clipboard and presses the paste chord (refused when the target has no known chord, because a '
       + 'wrong chord injects a literal ^V into a terminal). Activate the target window first.',
     parameters: compileParameters({
-      action: { type: 'string', required: true, enum: ['type', 'press', 'down', 'up'], description: 'What to do.' },
+      action: { type: 'string', required: true, enum: ['type', 'press', 'down', 'up', 'hold', 'release_all'], description: 'What to do.' },
       text: { type: 'string', description: 'For action=type: the text to type.' },
       keys: {
         type: 'string',
-        description: 'For press/down/up: a chord like "ctrl+shift+v", "Return", "F5", or a single character.',
+        description: 'For press/down/up/hold: a chord like "ctrl+shift+v", "Return", "F5", or a single character.',
+      },
+      holdMs: { type: 'integer', description: 'For hold: how long to keep the chord down, in milliseconds.' },
+      leaseMs: {
+        type: 'integer',
+        description: 'For down (keyboard, and mouse down): auto-release after this many ms. Default 1000, max 30000.',
+      },
+      wait: {
+        type: 'boolean',
+        description: 'For hold: false returns at once and lets the bridge release on time, so you can act meanwhile.',
       },
       unicode: {
         type: 'boolean',

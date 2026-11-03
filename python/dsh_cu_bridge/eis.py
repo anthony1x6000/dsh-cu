@@ -31,6 +31,7 @@ import ctypes
 import ctypes.util
 import os
 import select
+import threading
 import time
 from typing import Any
 
@@ -38,6 +39,7 @@ import dbus
 import dbus.bus
 from dbus.mainloop.glib import DBusGMainLoop
 
+from . import leases
 from .rpc import BridgeError
 
 # --- libei surface -----------------------------------------------------------
@@ -188,6 +190,8 @@ class EISClient:
         self._keyboard: int = 0
         self._eis_iface: Any = None
         self._emulating: set[int] = set()
+        # The lease watchdog releases from its own thread; one frame at a time.
+        self._send_lock = threading.RLock()
         self._lost_at: dict[str, float] = {}
         self._disconnected = False
         self._sequence = 0
@@ -400,10 +404,11 @@ class EISClient:
     def pointer_button(self, button: int, state: int) -> None:
         """Press or release one mouse button by evdev code."""
         library = get_libei()
-        device = self._live_device("pointer")
-        library.ei_device_button_button(device, int(button), int(state))
-        library.ei_device_frame(device, self._now_us())
-        self._flush()
+        with self._send_lock:
+            device = self._live_device("pointer")
+            library.ei_device_button_button(device, int(button), int(state))
+            library.ei_device_frame(device, self._now_us())
+            self._flush()
 
     def pointer_scroll_discrete(self, dx: int, dy: int) -> None:
         """Scroll by whole wheel detents (120ths of a detent are rejected)."""
@@ -432,10 +437,11 @@ class EISClient:
     def keyboard_key(self, keycode: int, state: int) -> None:
         """Press or release one evdev keycode."""
         library = get_libei()
-        device = self._live_device("keyboard")
-        library.ei_device_keyboard_key(device, int(keycode), int(state))
-        library.ei_device_frame(device, self._now_us())
-        self._flush()
+        with self._send_lock:
+            device = self._live_device("keyboard")
+            library.ei_device_keyboard_key(device, int(keycode), int(state))
+            library.ei_device_frame(device, self._now_us())
+            self._flush()
 
     def close(self) -> None:
         """Tear the connection down in the order libei requires."""
@@ -515,8 +521,8 @@ class Input:
                 time.sleep(CLICK_PRESS_S)
             self._client.pointer_button(code, RELEASED)
 
-    def button_down(self, x: int, y: int, *, button: str = "left") -> None:
-        """Press and hold one button, entering drag mode."""
+    def button_down(self, x: int, y: int, *, button: str = "left", lease_s: float | None = None) -> None:
+        """Press and hold one button, entering drag mode, for at most its lease."""
         code = BUTTON_CODES.get(button)
         if code is None:
             raise BridgeError(f"unknown mouse button {button!r}", "BAD_ARGUMENT")
@@ -524,6 +530,7 @@ class Input:
         time.sleep(MOVE_SETTLE_S)
         self._client.pointer_button(code, PRESSED)
         self._held.add(button)
+        grant("button", code, lease_s)
 
     def button_up(self, x: int, y: int, *, button: str = "left") -> None:
         """Release one held button; releasing never leaves drag mode stuck."""
@@ -536,6 +543,7 @@ class Input:
             self._client.pointer_button(code, RELEASED)
         finally:
             self._held.discard(button)
+            LEASES.drop("button", code)
 
     def drag(self, x: int, y: int, *, to_x: int, to_y: int, button: str = "left", steps: int = 20) -> None:
         """Press at one point, move along a straight path, release at the end."""
@@ -591,19 +599,50 @@ class Input:
                 time.sleep(STEP_SLEEP_S)
                 self._client.keyboard_key(code, RELEASED)
 
-    def key_down(self, modifiers: list[int], keycode: int) -> None:
-        """Hold modifiers and one main key."""
-        for code in modifiers:
-            self._client.keyboard_key(code, PRESSED)
-            time.sleep(STEP_SLEEP_S)
-        self._client.keyboard_key(keycode, PRESSED)
+    def key_down(self, modifiers: list[int], keycode: int, lease_s: float | None = None) -> float:
+        """Hold modifiers and one main key until released or the lease runs out.
 
-    def key_up(self, modifiers: list[int], keycode: int) -> None:
-        """Release the main key first, then modifiers in reverse."""
+        Returns the lease length actually granted, in seconds.
+        """
+        for code in [*modifiers, keycode]:
+            self._client.keyboard_key(code, PRESSED)
+            grant("key", code, lease_s)
+            time.sleep(STEP_SLEEP_S)
+        return min(DEFAULT_LEASE_S if lease_s is None else lease_s, MAX_LEASE_S)
+
+    def key_up(self, modifiers: list[int], keycode: int) -> str:
+        """Release the main key first, then modifiers in reverse.
+
+        Returns what the main key was: ``held``, ``expired`` (its lease already
+        gave it back) or ``unheld``. The release is sent regardless, so a key
+        the bridge lost track of is never left down.
+        """
+        state = LEASES.drop("key", keycode)
         self._client.keyboard_key(keycode, RELEASED)
         for code in reversed(modifiers):
             time.sleep(STEP_SLEEP_S)
+            LEASES.drop("key", code)
             self._client.keyboard_key(code, RELEASED)
+        return state
+
+    def hold_key(self, modifiers: list[int], keycode: int, hold_s: float, *, wait: bool = True) -> None:
+        """Hold a chord for ``hold_s`` seconds, then release it, in one gesture.
+
+        The bridge owns the timing, so the caller's latency cannot lengthen the
+        hold. With ``wait=False`` the call returns at once and the watchdog
+        does the release.
+        """
+        self.key_down(modifiers, keycode, hold_s)
+        if not wait:
+            return
+        try:
+            time.sleep(hold_s)
+        finally:
+            self.key_up(modifiers, keycode)
+
+    def release_all(self) -> list[tuple[str, int]]:
+        """Release every held key and button, returning what was held."""
+        return release_all()
 
     def type_plan(self, plan: list[tuple[int, bool]]) -> None:
         """Type a pre-computed US-QWERTY keystroke plan."""
@@ -622,6 +661,34 @@ class Input:
 
 # Process-wide client, replaced when the compositor closes the connection.
 _client: EISClient | None = None
+
+DEFAULT_LEASE_S = leases.DEFAULT_LEASE_S
+MAX_LEASE_S = leases.MAX_LEASE_S
+
+
+def _release_held(kind: str, code: int) -> None:
+    """Give one leased input back to the compositor."""
+    if kind == "button":
+        client().pointer_button(code, RELEASED)
+    else:
+        client().keyboard_key(code, RELEASED)
+
+
+LEASES = leases.Leases(_release_held)
+_watchdog: threading.Thread | None = None
+
+
+def grant(kind: str, code: int, lease_s: float | None = None) -> None:
+    """Lease a newly held input, starting the watchdog the first time."""
+    global _watchdog
+    LEASES.grant(kind, code, lease_s)
+    if _watchdog is None:
+        _watchdog = LEASES.watch()
+
+
+def release_all() -> list[tuple[str, int]]:
+    """Release every held key and button now."""
+    return LEASES.release_all()
 
 
 def client() -> EISClient:
@@ -649,8 +716,9 @@ def input_session() -> Input:
 
 
 def shutdown() -> None:
-    """Close the process-wide client, if one is open."""
+    """Release anything held, then close the process-wide client, if one is open."""
     global _client
+    LEASES.release_all()
     if _client is not None:
         with_closing(_client)
         _client = None

@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-from dsh_cu_bridge import atspi, flatpak, keys, kwin, rpc, session, shot, wait  # noqa: E402
+from dsh_cu_bridge import atspi, eis, flatpak, keys, kwin, leases, rpc, session, shot, wait  # noqa: E402
 
 
 def _window_matches(window: dict, **filters: str) -> bool:
@@ -537,3 +537,184 @@ class SpectacleEnvironmentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LeaseTests(unittest.TestCase):
+    """A held key is a loan: it comes back on a deadline, whatever the caller does."""
+
+    def setUp(self) -> None:
+        self.now = 100.0
+        self.released: list[tuple[str, int]] = []
+        self.book = leases.Leases(
+            lambda kind, code: self.released.append((kind, code)),
+            clock=lambda: self.now,
+            default_s=1.0,
+            max_s=5.0,
+        )
+
+    def test_a_key_held_past_its_lease_is_released_by_the_reaper(self) -> None:
+        self.book.grant("key", 32)
+        self.now += 1.01
+        self.book.reap()
+        self.assertEqual(self.released, [("key", 32)])
+
+    def test_a_key_inside_its_lease_is_left_alone(self) -> None:
+        self.book.grant("key", 32)
+        self.now += 0.5
+        self.book.reap()
+        self.assertEqual(self.released, [])
+
+    def test_an_explicit_lease_overrides_the_default(self) -> None:
+        self.book.grant("key", 32, 3.0)
+        self.now += 2.0
+        self.book.reap()
+        self.assertEqual(self.released, [])
+
+    def test_a_lease_is_capped_so_no_key_can_be_held_for_long(self) -> None:
+        deadline = self.book.grant("key", 32, 999.0)
+        self.assertEqual(deadline, 105.0)
+
+    def test_a_non_positive_lease_is_refused(self) -> None:
+        with self.assertRaises(rpc.BridgeError):
+            self.book.grant("key", 32, 0)
+
+    def test_regranting_extends_the_deadline_instead_of_stacking(self) -> None:
+        self.book.grant("key", 32)
+        self.now += 0.9
+        self.book.grant("key", 32)
+        self.now += 0.9
+        self.book.reap()
+        self.assertEqual(self.released, [])
+
+    def test_dropping_a_held_key_reports_held_and_disarms_the_reaper(self) -> None:
+        self.book.grant("key", 32)
+        self.assertEqual(self.book.drop("key", 32), "held")
+        self.now += 10
+        self.book.reap()
+        self.assertEqual(self.released, [])
+
+    def test_dropping_after_expiry_says_the_lease_already_released_it(self) -> None:
+        self.book.grant("key", 32)
+        self.now += 2
+        self.book.reap()
+        self.assertEqual(self.book.drop("key", 32), "expired")
+
+    def test_dropping_a_key_never_held_says_so(self) -> None:
+        self.assertEqual(self.book.drop("key", 32), "unheld")
+
+    def test_release_all_returns_every_held_key_and_empties_the_book(self) -> None:
+        self.book.grant("key", 32)
+        self.book.grant("button", 272)
+        released = self.book.release_all()
+        self.assertCountEqual(released, [("key", 32), ("button", 272)])
+        self.assertCountEqual(self.released, [("key", 32), ("button", 272)])
+        self.assertEqual(self.book.held(), [])
+
+    def test_a_failing_release_still_forgets_the_key(self) -> None:
+        def boom(kind: str, code: int) -> None:
+            raise RuntimeError("compositor went away")
+
+        book = leases.Leases(boom, clock=lambda: self.now)
+        book.grant("key", 32)
+        self.now += 2
+        book.reap()
+        self.assertEqual(book.held(), [])
+
+    def test_next_deadline_is_the_earliest_outstanding_one(self) -> None:
+        self.assertIsNone(self.book.next_deadline())
+        self.book.grant("key", 32, 3.0)
+        self.book.grant("key", 30, 1.0)
+        self.assertEqual(self.book.next_deadline(), 101.0)
+
+
+class _FakeClient:
+    """Records what would reach the compositor, in order."""
+
+    _disconnected = False
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int, int]] = []
+
+    def keyboard_key(self, code: int, state: int) -> None:
+        self.events.append(("key", code, state))
+
+    def pointer_button(self, code: int, state: int) -> None:
+        self.events.append(("button", code, state))
+
+
+class InputLeaseTests(unittest.TestCase):
+    """The gestures that hold input must always hand it back."""
+
+    D, SHIFT = 32, 42
+
+    def setUp(self) -> None:
+        self.fake = _FakeClient()
+        self.saved = (eis._client, eis.LEASES)
+        eis._client = self.fake  # type: ignore[assignment]
+        self.now = 0.0
+        eis.LEASES = leases.Leases(eis._release_held, clock=lambda: self.now)
+        self.input = eis.Input(self.fake)  # type: ignore[arg-type]
+
+    def tearDown(self) -> None:
+        eis._client, eis.LEASES = self.saved
+
+    def test_a_timed_hold_presses_then_releases_without_a_second_call(self) -> None:
+        self.input.hold_key([], self.D, 0.01)
+        self.assertEqual(self.fake.events, [("key", self.D, 1), ("key", self.D, 0)])
+        self.assertEqual(eis.LEASES.held(), [])
+
+    def test_a_timed_hold_releases_even_when_interrupted(self) -> None:
+        original = eis.time.sleep
+
+        def interrupted(seconds: float) -> None:
+            if seconds >= 0.5:
+                raise KeyboardInterrupt
+            original(seconds)
+
+        eis.time.sleep = interrupted
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                self.input.hold_key([], self.D, 0.5)
+        finally:
+            eis.time.sleep = original
+        self.assertEqual(self.fake.events[-1], ("key", self.D, 0))
+
+    def test_a_hold_without_wait_leaves_the_release_to_the_watchdog(self) -> None:
+        self.input.hold_key([], self.D, 0.4, wait=False)
+        self.assertEqual(self.fake.events, [("key", self.D, 1)])
+        self.now += 0.5
+        eis.LEASES.reap()
+        self.assertEqual(self.fake.events[-1], ("key", self.D, 0))
+
+    def test_a_key_down_nobody_releases_is_released_when_the_lease_ends(self) -> None:
+        self.input.key_down([], self.D)
+        self.now += 1.5
+        eis.LEASES.reap()
+        self.assertEqual(self.fake.events, [("key", self.D, 1), ("key", self.D, 0)])
+
+    def test_the_modifiers_of_a_held_chord_are_leased_too(self) -> None:
+        self.input.key_down([self.SHIFT], self.D)
+        self.now += 1.5
+        eis.LEASES.reap()
+        released = {code for kind, code, state in self.fake.events if state == 0}
+        self.assertEqual(released, {self.D, self.SHIFT})
+
+    def test_key_up_after_the_lease_ran_out_reports_it(self) -> None:
+        self.input.key_down([], self.D)
+        self.now += 1.5
+        eis.LEASES.reap()
+        self.assertEqual(self.input.key_up([], self.D), "expired")
+
+    def test_key_up_of_a_live_hold_reports_held_and_sends_one_release(self) -> None:
+        self.input.key_down([], self.D)
+        self.assertEqual(self.input.key_up([], self.D), "held")
+        self.now += 5
+        eis.LEASES.reap()
+        self.assertEqual(self.fake.events, [("key", self.D, 1), ("key", self.D, 0)])
+
+    def test_release_all_frees_keys_and_buttons(self) -> None:
+        self.input.key_down([], self.D)
+        eis.LEASES.grant("button", 272)
+        self.input.release_all()
+        released = {(kind, code) for kind, code, state in self.fake.events if state == 0}
+        self.assertEqual(released, {("key", self.D), ("button", 272)})
