@@ -78,6 +78,8 @@ MAX_DISPATCH_ROUNDS = 64
 CLICK_PRESS_S = 0.025
 MULTI_CLICK_GAP_S = 0.06
 STEP_SLEEP_S = 0.01
+# Relative look steps only need to land in different frames (~4 ms at 240 Hz is plenty).
+LOOK_STEP_SLEEP_S = 0.004
 MOVE_SETTLE_S = 0.02
 
 _libei: Any = None
@@ -597,12 +599,12 @@ class Input:
         finally:
             self.button_up(to_x, to_y, button=button)
 
-    def look(self, dx: int, dy: int, *, max_step: int = 20) -> int:
+    def look(self, dx: int, dy: int, *, max_step: int = 40) -> int:
         """Turn the camera by a relative delta, as a run of small mouse movements."""
         steps = plan_look(dx, dy, max_step=max_step)
         for step_x, step_y in steps:
             self._client.pointer_move_relative(step_x, step_y)
-            time.sleep(STEP_SLEEP_S)
+            time.sleep(LOOK_STEP_SLEEP_S)
         return len(steps)
 
     def scroll(self, x: int, y: int, *, amount: int, horizontal: bool = False, discrete: bool = True) -> None:

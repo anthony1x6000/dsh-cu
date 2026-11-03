@@ -831,3 +831,70 @@ class LookPlanTests(unittest.TestCase):
     def test_a_non_positive_cap_is_refused(self) -> None:
         with self.assertRaises(rpc.BridgeError):
             eis.plan_look(10, 0, max_step=0)
+
+
+class BatchTests(unittest.TestCase):
+    """One request, many actions: the model's latency is paid once, not per action."""
+
+    def setUp(self) -> None:
+        from dsh_cu_bridge import __main__ as bridge
+
+        self.bridge = bridge
+        self.calls: list[tuple[str, dict]] = []
+        self.saved = dict(bridge.OPS)
+
+        def record(name: str):
+            def handler(args: dict) -> dict:
+                self.calls.append((name, args))
+                if args.get("fail"):
+                    raise rpc.BridgeError("nope", "BOOM")
+                return {"name": name}
+
+            return handler
+
+        bridge.OPS["a"] = record("a")
+        bridge.OPS["b"] = record("b")
+
+    def tearDown(self) -> None:
+        self.bridge.OPS.clear()
+        self.bridge.OPS.update(self.saved)
+
+    def run_batch(self, steps: list, **extra) -> dict:
+        return self.bridge.dispatch({"id": 1, "op": "batch", "args": {"steps": steps, **extra}})
+
+    def test_steps_run_in_order_and_report_each_result(self) -> None:
+        frame = self.run_batch([{"op": "a"}, {"op": "b", "args": {"x": 1}}])
+        self.assertTrue(frame["ok"])
+        self.assertEqual([c[0] for c in self.calls], ["a", "b"])
+        self.assertEqual([r["result"]["name"] for r in frame["result"]["results"]], ["a", "b"])
+
+    def test_the_first_failure_stops_the_batch_and_says_where(self) -> None:
+        frame = self.run_batch([{"op": "a"}, {"op": "b", "args": {"fail": True}}, {"op": "a"}])
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(frame["result"]["failedAt"], 1)
+        self.assertEqual(frame["result"]["results"][1]["error"]["code"], "BOOM")
+
+    def test_continue_on_error_runs_the_rest(self) -> None:
+        frame = self.run_batch([{"op": "b", "args": {"fail": True}}, {"op": "a"}], continueOnError=True)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(frame["result"]["failedAt"], 0)
+
+    def test_a_batch_cannot_nest_or_shut_the_bridge_down(self) -> None:
+        for forbidden in ("batch", "shutdown"):
+            frame = self.run_batch([{"op": forbidden}])
+            self.assertEqual(frame["result"]["results"][0]["error"]["code"], "BAD_ARGUMENT")
+
+    def test_an_unknown_op_fails_that_step_not_the_bridge(self) -> None:
+        frame = self.run_batch([{"op": "nope"}])
+        self.assertEqual(frame["result"]["results"][0]["error"]["code"], "UNKNOWN_OP")
+
+    def test_sleep_is_a_bridge_side_wait_with_a_cap(self) -> None:
+        started = time.monotonic()
+        self.assertTrue(self.bridge.dispatch({"id": 1, "op": "sleep", "args": {"ms": 30}})["ok"])
+        self.assertGreaterEqual(time.monotonic() - started, 0.03)
+        frame = self.bridge.dispatch({"id": 1, "op": "sleep", "args": {"ms": 999999}})
+        self.assertEqual(frame["error"]["code"], "BAD_ARGUMENT")
+
+    def test_an_empty_or_malformed_batch_is_refused(self) -> None:
+        self.assertEqual(self.run_batch([])["error"]["code"], "BAD_ARGUMENT")
+        self.assertEqual(self.run_batch(["a"])["error"]["code"], "BAD_ARGUMENT")

@@ -330,6 +330,22 @@ python3 tests/validate_schemas.py            # meta-schema check of every tool s
 python3 tests/validate_schemas.py --session <log.jsonl>   # every tool in a recorded request
 ```
 
+### Latency: where the time goes
+
+Measured per operation on the live desktop (median): `pointer.position` 10 ms,
+`keyboard press` 10 ms, `window.list` 20 ms, `mouse move` 47 ms, `click` 83 ms,
+`screenshot` 570 ms (Spectacle). A model turn is seconds, so the cost that
+matters is round trips, not these. Following agent-desktop's `batch` and its
+rule that a fixed sleep is a race, the bridge has:
+
+* `cu_batch` / `batch`: N operations in one request, plus a bridge-side `sleep`;
+  the e2e's whole walk-aim-mine route is one call.
+* `mouse look` skips both KWin cursor reads (about 20 ms) and sends fewer,
+  larger steps, so a 300-count turn went from 163 ms to a fraction of that.
+* the e2e waits on conditions (window caption, game log, window gone) rather
+  than sleeping: the full run went from about 51 s to about 35 s, of which 22 s
+  is the JVM starting.
+
 ### Minecraft end-to-end
 
 `tests/e2e_minecraft.py` drives a real game, because a latency-sensitive game is

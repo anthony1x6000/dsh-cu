@@ -97,7 +97,7 @@ for (const spec of TOOL_SPECS) {
 const mutating = TOOL_SPECS.filter((spec) => spec.mutating === true).map((spec) => spec.suffix)
 assert.deepEqual(
   mutating.sort(),
-  ['a11y_invoke', 'clipboard', 'keyboard', 'launch', 'mouse', 'window'],
+  ['a11y_invoke', 'batch', 'clipboard', 'keyboard', 'launch', 'mouse', 'window'],
   'the mutating set is what enableInput gates',
 )
 
