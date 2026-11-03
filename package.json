@@ -46,6 +46,7 @@
     "selfcheck": "node --experimental-strip-types selfcheck.ts",
     "test:python": "python3 -m unittest discover -s tests -p 'test_*.py' -v",
     "test:integration": "python3 tests/integration.py",
+    "test:e2e": "python3 tests/e2e_minecraft.py",
     "test": "pnpm run selfcheck && pnpm run test:python"
   },
   "repository": {

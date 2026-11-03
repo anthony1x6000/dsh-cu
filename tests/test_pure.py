@@ -804,3 +804,30 @@ class InputLeaseTests(unittest.TestCase):
         self.input.release_all()
         released = {(kind, code) for kind, code, state in self.fake.events if state == 0}
         self.assertEqual(released, {("key", self.D), ("button", 272)})
+
+
+class LookPlanTests(unittest.TestCase):
+    """A camera turn is delivered as several small relative moves, never one jump."""
+
+    def test_the_steps_add_up_to_exactly_the_requested_turn(self) -> None:
+        steps = eis.plan_look(137, -59, max_step=20)
+        self.assertEqual(sum(dx for dx, _ in steps), 137)
+        self.assertEqual(sum(dy for _, dy in steps), -59)
+
+    def test_no_step_exceeds_the_cap_on_either_axis(self) -> None:
+        steps = eis.plan_look(200, 80, max_step=25)
+        self.assertTrue(all(abs(dx) <= 25 and abs(dy) <= 25 for dx, dy in steps))
+
+    def test_a_small_turn_is_a_single_step(self) -> None:
+        self.assertEqual(eis.plan_look(5, -3, max_step=20), [(5, -3)])
+
+    def test_a_zero_turn_has_no_steps(self) -> None:
+        self.assertEqual(eis.plan_look(0, 0, max_step=20), [])
+
+    def test_the_turn_is_spread_evenly_not_front_loaded(self) -> None:
+        steps = eis.plan_look(100, 0, max_step=25)
+        self.assertEqual([dx for dx, _ in steps], [25, 25, 25, 25])
+
+    def test_a_non_positive_cap_is_refused(self) -> None:
+        with self.assertRaises(rpc.BridgeError):
+            eis.plan_look(10, 0, max_step=0)
