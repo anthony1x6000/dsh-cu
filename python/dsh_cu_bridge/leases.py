@@ -30,6 +30,9 @@ MAX_LEASE_S = 30.0
 Release = Callable[[str, int], None]
 Held = tuple[str, int]
 
+# How often the watchdog re-checks the guard while anything is held.
+GUARD_POLL_S = 0.1
+
 
 class Leases:
     """Which inputs are held, and when each must be given back."""
@@ -41,6 +44,7 @@ class Leases:
         clock: Callable[[], float] = time.monotonic,
         default_s: float = DEFAULT_LEASE_S,
         max_s: float = MAX_LEASE_S,
+        guard: Callable[[], object] | None = None,
     ) -> None:
         self._release = release
         self._clock = clock
@@ -48,6 +52,10 @@ class Leases:
         self._max_s = max_s
         self._deadlines: dict[Held, float] = {}
         self._expired: set[Held] = set()
+        # Wayland resets key state on keyboard leave, so a hold must not outlive
+        # the window it was made into; the guard names that window.
+        self._guard = guard
+        self._anchor: object = None
         self._wake = threading.Condition()
 
     def grant(self, kind: str, code: int, lease_s: float | None = None) -> float:
@@ -56,7 +64,10 @@ class Leases:
         if seconds <= 0:
             raise BridgeError("a lease must be longer than 0 ms", "BAD_ARGUMENT")
         deadline = self._clock() + min(seconds, self._max_s)
+        anchor = self._read_guard() if self._deadlines == {} else None
         with self._wake:
+            if not self._deadlines:
+                self._anchor = anchor
             self._deadlines[(kind, code)] = deadline
             self._expired.discard((kind, code))
             self._wake.notify_all()
@@ -83,8 +94,9 @@ class Leases:
     def reap(self) -> list[Held]:
         """Release every hold whose deadline has passed."""
         now = self._clock()
+        moved = self._focus_moved()
         with self._wake:
-            due = [held for held, deadline in self._deadlines.items() if deadline <= now]
+            due = [held for held, deadline in self._deadlines.items() if moved or deadline <= now]
             for held in due:
                 del self._deadlines[held]
                 self._expired.add(held)
@@ -98,6 +110,20 @@ class Leases:
             self._deadlines.clear()
         self._give_back(everything)
         return everything
+
+    def _read_guard(self) -> object:
+        if self._guard is None:
+            return None
+        try:
+            return self._guard()
+        except Exception:  # noqa: BLE001 - an unreadable guard must never release early
+            return None
+
+    def _focus_moved(self) -> bool:
+        if self._guard is None or not self._deadlines or self._anchor is None:
+            return False
+        current = self._read_guard()
+        return current is not None and current != self._anchor
 
     def _give_back(self, holds: list[Held]) -> None:
         for kind, code in holds:
@@ -116,7 +142,8 @@ class Leases:
                     if deadline is None:
                         self._wake.wait()
                     else:
-                        self._wake.wait(max(0.0, deadline - self._clock()))
+                        until = max(0.0, deadline - self._clock())
+                        self._wake.wait(min(until, GUARD_POLL_S) if self._guard else until)
                 self.reap()
 
         thread = threading.Thread(target=run, name="dsh-cu-lease-watchdog", daemon=True)

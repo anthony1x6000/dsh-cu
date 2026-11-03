@@ -674,7 +674,15 @@ def _release_held(kind: str, code: int) -> None:
         client().keyboard_key(code, RELEASED)
 
 
-LEASES = leases.Leases(_release_held)
+def _focused_window() -> object:
+    """The active window's id, which a hold is bound to."""
+    from . import kwin
+
+    window = kwin.active_window()
+    return window.get("id") if window else ""  # "" is the desktop; None would mean unreadable
+
+
+LEASES = leases.Leases(_release_held, guard=_focused_window)
 _watchdog: threading.Thread | None = None
 
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -625,6 +626,91 @@ class LeaseTests(unittest.TestCase):
         self.book.grant("key", 32, 3.0)
         self.book.grant("key", 30, 1.0)
         self.assertEqual(self.book.next_deadline(), 101.0)
+
+
+class KwinScriptSerializationTests(unittest.TestCase):
+    """Two threads must never be inside the shared D-Bus reply sink at once."""
+
+    def test_concurrent_scripts_run_one_at_a_time(self) -> None:
+        import threading
+
+        inside = 0
+        overlap = []
+
+        def fake(js: str, timeout: float) -> str:
+            nonlocal inside
+            inside += 1
+            overlap.append(inside)
+            time.sleep(0.02)
+            inside -= 1
+            return "x"
+
+        original = kwin._run_kwin_script
+        kwin._run_kwin_script = fake
+        try:
+            threads = [threading.Thread(target=kwin.run_kwin_script, args=("", 1.0)) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            kwin._run_kwin_script = original
+        self.assertEqual(max(overlap), 1)
+
+
+class FocusGuardTests(unittest.TestCase):
+    """A key held into one window must not follow focus into another."""
+
+    def setUp(self) -> None:
+        self.now = 0.0
+        self.focus = "game"
+        self.released: list[tuple[str, int]] = []
+        self.book = leases.Leases(
+            lambda kind, code: self.released.append((kind, code)),
+            clock=lambda: self.now,
+            guard=lambda: self.focus,
+        )
+
+    def test_a_focus_change_releases_everything_held(self) -> None:
+        self.book.grant("key", 32)
+        self.focus = "terminal"
+        self.book.reap()
+        self.assertEqual(self.released, [("key", 32)])
+
+    def test_unchanged_focus_leaves_holds_alone(self) -> None:
+        self.book.grant("key", 32)
+        self.book.reap()
+        self.assertEqual(self.released, [])
+
+    def test_a_released_hold_is_reported_expired_on_up(self) -> None:
+        self.book.grant("key", 32)
+        self.focus = "terminal"
+        self.book.reap()
+        self.assertEqual(self.book.drop("key", 32), "expired")
+
+    def test_the_window_is_remembered_from_the_first_hold_not_the_latest(self) -> None:
+        self.book.grant("key", 32)
+        self.book.grant("key", 30)
+        self.focus = "terminal"
+        self.book.reap()
+        self.assertCountEqual(self.released, [("key", 32), ("key", 30)])
+
+    def test_a_guard_that_fails_never_releases_early(self) -> None:
+        def broken() -> str:
+            raise RuntimeError("kwin busy")
+
+        book = leases.Leases(lambda kind, code: self.released.append((kind, code)), clock=lambda: self.now, guard=broken)
+        book.grant("key", 32)
+        book.reap()
+        self.assertEqual(self.released, [])
+
+    def test_a_new_hold_after_everything_was_dropped_starts_a_fresh_window(self) -> None:
+        self.book.grant("key", 32)
+        self.book.drop("key", 32)
+        self.focus = "terminal"
+        self.book.grant("key", 32)
+        self.book.reap()
+        self.assertEqual(self.released, [])
 
 
 class _FakeClient:

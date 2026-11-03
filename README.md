@@ -214,6 +214,10 @@ held key is refused unless something can release it:
 * `down` (keyboard or mouse) carries a lease, `leaseMs`, default 1000, max
   30000. A watchdog thread releases it when it runs out. A later `up` reports
   `was: held`, `expired` or `unheld`, so the agent learns it was too slow.
+* A hold is bound to the window it was made into. Wayland clients repeat a
+  held key themselves and reset their key state on keyboard leave, so when the
+  active window changes (or focus goes to the desktop) the watchdog releases
+  everything within ~100 ms instead of waiting for the lease.
 * `release_all` frees everything, and the bridge does the same when its session
   ends, so nothing outlives the process that held it.
 
