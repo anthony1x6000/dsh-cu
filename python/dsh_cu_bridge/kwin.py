@@ -27,6 +27,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -231,7 +232,20 @@ def script_dir(env: dict[str, str] | None = None, cwd: str | None = None, sandbo
     return Path(tempfile.gettempdir())
 
 
+_script_lock = threading.Lock()
+
+
 def run_kwin_script(js_source: str, timeout: float = SCRIPT_TIMEOUT_S) -> str:
+    """Run one KWin script at a time: the reply sink's name and path are shared.
+
+    The lease watchdog reads the active window from its own thread while a tool
+    call may be running a script, and two exported sinks on one path collide.
+    """
+    with _script_lock:
+        return _run_kwin_script(js_source, timeout)
+
+
+def _run_kwin_script(js_source: str, timeout: float) -> str:
     """Run one KWin script and return the payload it reported over D-Bus.
 
     ``{sink}``/``{path}`` placeholders are filled with this call's reply
