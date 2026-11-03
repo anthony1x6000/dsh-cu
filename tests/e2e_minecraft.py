@@ -56,7 +56,10 @@ ROUTE = [
     ("hold", "w", 800),
     ("look", -20, -90),
 ]
-BREAK_MS = 5000
+BREAK_MS = int(os.environ.get("E2E_BREAK_MS", "4500"))  # bare hands take ~3 s; 3.4 s failed 2 of 6 runs
+SETTLE_MS = 150  # between route steps: lets the game apply the last input before the next
+WORLD_SETTLE_S = float(os.environ.get("E2E_WORLD_SETTLE_S", "1.0"))
+TRACE = bool(os.environ.get("E2E_TRACE"))
 LAUNCH_TIMEOUT_S = 180
 
 
@@ -139,6 +142,23 @@ class Game:
         """Click a screen pixel measured with the game's 854x480 client area at (533, 300)."""
         self.click((x - REF_LEFT) / 854, (y - REF_TOP) / 480)
 
+    def batch(self, steps: list[dict]) -> list[dict]:
+        """Several bridge operations in one request; raises on the first failed step."""
+        result = self.op("batch", {"steps": steps})
+        if result["failedAt"] is not None:
+            failed = result["results"][result["failedAt"]]
+            raise E2EFailure(f"batch step {result['failedAt']} ({failed['op']}) failed: {failed['error']}")
+        return result["results"]
+
+    def click_step(self, x: int, y: int) -> dict:
+        """A batchable click at a screen pixel measured on the reference window."""
+        left, top, width, height = self.window["client"]
+        return {"op": "mouse", "args": {
+            "action": "click",
+            "x": int(left + (x - REF_LEFT) / 854 * width),
+            "y": int(top + (y - REF_TOP) / 480 * height),
+        }}
+
     def hold(self, keys: str, ms: int) -> None:
         self.op("keyboard", {"action": "hold", "keys": keys, "holdMs": ms})
 
@@ -171,7 +191,7 @@ def stop_everything(game: Game) -> None:
         if window["app"] == APP or window["caption"].startswith("Minecraft"):
             game.op("window.control", {"action": "close", "windowId": window["id"]})
     subprocess.run(["flatpak", "kill", APP], check=False, capture_output=True)
-    time.sleep(1.5)
+    wait_until(lambda: not any(w["app"] == APP for w in game.windows()), "Prism to exit", 10)
 
 
 def create_world_through_the_ui(game: Game) -> None:
@@ -196,17 +216,41 @@ def create_world_through_the_ui(game: Game) -> None:
     game.click_px(800, 747)  # Create New World
 
 
+def wait_until(condition, what: str, timeout: float, interval: float = 0.1) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(interval)
+    raise E2EFailure(f"timed out after {timeout:g}s waiting for {what}")
+
+
+def in_world(game: Game) -> bool:
+    window = game.find_window()
+    return bool(window and window["caption"].endswith("Singleplayer"))
+
+
 def save_and_quit(game: Game) -> None:
+    """Escape, Save and Quit to Title, then wait for the world to be left (the save flushes stats)."""
     game.focus()
-    game.op("keyboard", {"action": "press", "keys": "Escape"})
-    time.sleep(1.0)
-    game.click_px(958, 647)  # Save and Quit to Title
-    time.sleep(4.0)
+    game.batch([
+        {"op": "keyboard", "args": {"action": "press", "keys": "Escape"}},
+        {"op": "sleep", "args": {"ms": 250}},  # the pause menu animates in
+        game.click_step(958, 647),  # Save and Quit to Title
+    ])
+    wait_until(lambda: not in_world(game), "the world to be saved and left", 30)
 
 
 def quit_game(game: Game) -> None:
-    game.click_px(1059, 703)  # Quit Game on the title screen
-    time.sleep(3.0)
+    """Click Quit Game until the window goes: the title screen is not clickable the instant it is shown."""
+    for _ in range(8):
+        if game.find_window() is None:
+            return
+        game.batch([game.click_step(1059, 703)])
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and game.find_window() is not None:
+            time.sleep(0.1)
+    wait_until(lambda: game.find_window() is None, "the game to exit", 10)
 
 
 def run_snapshot(game: Game) -> None:
@@ -223,6 +267,25 @@ def run_snapshot(game: Game) -> None:
     print(f"snapshot stored: {SAVES / (WORLD + '.pristine')}")
 
 
+def route_steps(game: Game) -> list[dict]:
+    """The whole walk-aim-mine sequence as one batch: no round trip, so no agent lag, between actions."""
+    left, top, width, height = game.window["client"]
+    centre = {"x": left + width // 2, "y": top + height // 2, "button": "left"}
+    steps: list[dict] = []
+    for step in ROUTE:
+        if step[0] == "look":
+            steps.append({"op": "mouse", "args": {"action": "look", "dx": step[1], "dy": step[2]}})
+        else:
+            steps.append({"op": "keyboard", "args": {"action": "hold", "keys": step[1], "holdMs": step[2]}})
+        steps.append({"op": "sleep", "args": {"ms": SETTLE_MS}})
+    steps.append({"op": "mouse", "args": {"action": "down", "leaseMs": BREAK_MS + 1000, **centre}})
+    steps.append({"op": "sleep", "args": {"ms": BREAK_MS}})
+    steps.append({"op": "mouse", "args": {"action": "up", **centre}})
+    if TRACE:
+        steps.append({"op": "screenshot"})
+    return steps
+
+
 def run_tree(game: Game) -> dict:
     pristine = SAVES / f"{WORLD}.pristine"
     if not pristine.exists():
@@ -230,36 +293,35 @@ def run_tree(game: Game) -> dict:
     shutil.rmtree(SAVES / WORLD, ignore_errors=True)
     shutil.copytree(pristine, SAVES / WORLD)
     timings: dict[str, float] = {}
-    started = time.monotonic()
+    clock = time.monotonic()
+
+    def lap(name: str) -> None:
+        nonlocal clock
+        now = time.monotonic()
+        timings[name] = round(now - clock, 2)
+        clock = now
+
     launch(world=True)
-    game.wait_window(lambda caption: caption.endswith("Singleplayer"), "the world to load", LAUNCH_TIMEOUT_S)
-    timings["launch_to_world_s"] = round(time.monotonic() - started, 1)
-    time.sleep(2.0)  # let the first chunks arrive before moving
+    wait_until(lambda: in_world(game), "the world to load", LAUNCH_TIMEOUT_S, interval=0.25)
+    lap("launch_to_world_s")
+    time.sleep(WORLD_SETTLE_S)  # the first chunks must arrive before the player moves
     game.focus()
+    lap("settle_focus_s")
     before = stats_mined()
-    game.trace("in world")
-    for step in ROUTE:
-        if step[0] == "look":
-            game.op("mouse", {"action": "look", "dx": step[1], "dy": step[2]})
-        else:
-            game.hold(step[1], step[2])
-        time.sleep(0.3)
-    game.trace("at the tree")
-    left, top, width, height = game.window["client"]
-    centre = {"x": left + width // 2, "y": top + height // 2, "button": "left"}
-    mined_at = time.monotonic()
-    game.op("mouse", {"action": "down", "leaseMs": BREAK_MS + 1000, **centre})
-    time.sleep(BREAK_MS / 1000)
-    game.op("mouse", {"action": "up", **centre})
-    game.trace("after mining")
-    timings["mine_s"] = round(time.monotonic() - mined_at, 1)
-    save_and_quit(game)  # a save is what flushes the statistics file
+    results = game.batch(route_steps(game))
+    lap("route_and_mine_s")
+    if TRACE:
+        print(f"  after mining: {results[-1]['result']['path']}")
+    save_and_quit(game)
+    lap("save_quit_s")
     after = stats_mined()
     quit_game(game)
+    lap("quit_game_s")
     stop_everything(game)
+    lap("stop_s")
     if after <= before:
         raise E2EFailure(f"no oak log was mined (before={before}, after={after})")
-    return {"oak_logs_mined": after - before, **timings}
+    return {"oak_logs_mined": after - before, "total_s": round(sum(timings.values()), 1), **timings}
 
 
 def main() -> int:

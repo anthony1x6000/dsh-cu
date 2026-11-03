@@ -268,6 +268,10 @@ def op_mouse(args: dict[str, Any]) -> dict[str, Any]:
     """Move, click, drag, or scroll the pointer."""
     action = _str(args, "action", "click")
     session = eis.input_session()
+    if action == "look":
+        # Relative motion: the global cursor position is irrelevant, so skip both KWin reads.
+        steps = session.look(_int(args, "dx", 0), _int(args, "dy", 0), max_step=_int(args, "stepPx", 40))
+        return {"action": action, "steps": steps}
     before = kwin.cursor_position()
     if action == "position":
         return {"position": before, "action": action}
@@ -307,9 +311,6 @@ def op_mouse(args: dict[str, Any]) -> dict[str, Any]:
             button=_str(args, "button", "left"),
             steps=_int(args, "steps", 20),
         )
-    elif action == "look":
-        steps = session.look(_int(args, "dx", 0), _int(args, "dy", 0), max_step=_int(args, "stepPx", 20))
-        return {"action": action, "steps": steps}
     elif action == "scroll":
         session.scroll(
             _int(args, "x"),
@@ -325,6 +326,55 @@ def op_mouse(args: dict[str, Any]) -> dict[str, Any]:
             "BAD_ARGUMENT",
         )
     return {"action": action, "positionBefore": before, "position": kwin.cursor_position()}
+
+
+MAX_SLEEP_MS = 10_000
+BATCH_FORBIDDEN = ("batch", "shutdown")
+
+
+@op("sleep")
+def op_sleep(args: dict[str, Any]) -> dict[str, Any]:
+    """Wait inside the bridge, so a pause between batched actions costs no round trip."""
+    ms = _int(args, "ms")
+    if not 0 <= ms <= MAX_SLEEP_MS:
+        raise BridgeError(f"sleep ms must be 0..{MAX_SLEEP_MS}", "BAD_ARGUMENT")
+    time.sleep(ms / 1000.0)
+    return {"slept": ms}
+
+
+@op("batch")
+def op_batch(args: dict[str, Any]) -> dict[str, Any]:
+    """Run several operations in order from one request.
+
+    A model turn costs seconds and a bridge call costs milliseconds, so the win
+    is doing N actions per turn. Stops at the first failure unless
+    ``continueOnError``; ``failedAt`` is the index of the first one that failed.
+    """
+    steps = args.get("steps")
+    if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
+        raise BridgeError("batch needs a non-empty steps array of {op, args} objects", "BAD_ARGUMENT")
+    keep_going = _bool(args, "continueOnError")
+    results: list[dict[str, Any]] = []
+    failed_at: int | None = None
+    for index, step in enumerate(steps):
+        name = str(step.get("op"))
+        started = time.monotonic()
+        try:
+            if name in BATCH_FORBIDDEN:
+                raise BridgeError(f"{name!r} cannot run inside a batch", "BAD_ARGUMENT")
+            handler = OPS.get(name)
+            if handler is None:
+                raise BridgeError(f"unknown op {name!r}", "UNKNOWN_OP")
+            entry: dict[str, Any] = {"op": name, "ok": True, "result": handler(step.get("args") or {})}
+        except BaseException as exc:  # noqa: BLE001 - a step failure is data, not a crash
+            entry = {"op": name, "ok": False, "error": rpc.failure(None, exc)["error"]}
+            if failed_at is None:
+                failed_at = index
+        entry["elapsedMs"] = wait.millis(time.monotonic() - started)
+        results.append(entry)
+        if not entry["ok"] and not keep_going:
+            break
+    return {"results": results, "failedAt": failed_at}
 
 
 @op("keyboard")

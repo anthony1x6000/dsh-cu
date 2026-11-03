@@ -1038,6 +1038,36 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     }),
   },
   {
+    suffix: 'batch',
+    op: 'batch',
+    concurrencySafe: false,
+    mutating: true,
+    timeoutMs: 300_000,
+    description: 'Run several desktop operations in ONE call, in order, with no model turn between them. Your own '
+      + 'latency is the slowest part of any real-time task: a key you hold while you think keeps acting, and every '
+      + 'extra turn is seconds. Put the whole short sequence here, e.g. steps=[{op:"mouse",args:{action:"look",dx:200,dy:0}},'
+      + '{op:"keyboard",args:{action:"hold",keys:"w",holdMs:800}},{op:"sleep",args:{ms:200}},'
+      + '{op:"mouse",args:{action:"click",x:900,y:500}}]. Ops are the bridge op names (mouse, keyboard, window.control, '
+      + 'screenshot, ...); sleep waits inside the bridge. Stops at the first failure and reports failedAt, unless '
+      + 'continueOnError. Take one screenshot step last to verify instead of one per action.',
+    parameters: compileParameters({
+      steps: {
+        type: 'array',
+        required: true,
+        items: {
+          type: 'object',
+          properties: {
+            op: { type: 'string', description: 'Bridge operation name, e.g. mouse, keyboard, sleep.' },
+            args: { type: 'object', description: 'That operation\'s arguments, as in its own tool.' },
+          },
+          required: ['op'],
+        },
+        description: 'Operations to run in order.',
+      },
+      continueOnError: { type: 'boolean', description: 'Keep going after a failed step. Default false.' },
+    }),
+  },
+  {
     suffix: 'clipboard',
     op: 'clipboard',
     concurrencySafe: false,
