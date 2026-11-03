@@ -307,6 +307,9 @@ def op_mouse(args: dict[str, Any]) -> dict[str, Any]:
             button=_str(args, "button", "left"),
             steps=_int(args, "steps", 20),
         )
+    elif action == "look":
+        steps = session.look(_int(args, "dx", 0), _int(args, "dy", 0), max_step=_int(args, "stepPx", 20))
+        return {"action": action, "steps": steps}
     elif action == "scroll":
         session.scroll(
             _int(args, "x"),
@@ -318,7 +321,7 @@ def op_mouse(args: dict[str, Any]) -> dict[str, Any]:
     else:
         raise BridgeError(
             f"unknown mouse action {action!r}; expected move, click, double_click, "
-            "triple_click, down, up, drag, scroll, or position",
+            "triple_click, down, up, drag, scroll, look, or position",
             "BAD_ARGUMENT",
         )
     return {"action": action, "positionBefore": before, "position": kwin.cursor_position()}

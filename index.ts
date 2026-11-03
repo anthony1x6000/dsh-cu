@@ -850,7 +850,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
     description:
       'Move, click, drag, or scroll the pointer. Coordinates are global logical pixels, which is also the '
       + 'coordinate space of cu_windows, cu_a11y_find and cu_screenshot. Actions: move, click, double_click, '
-      + 'triple_click, down, up, drag (needs x,y and toX,toY), scroll (amount in wheel steps), and position, '
+      + 'triple_click, down, up, drag (needs x,y and toX,toY), scroll (amount in wheel steps), look (turn the camera '
+      + 'of a game that grabs the pointer: relative dx,dy in mouse counts, about one pixel each, sent as small '
+      + 'steps; absolute moves do nothing there), and position, '
       + 'which reads the current pointer position. Injection goes through the compositor, so it reaches '
       + 'Wayland, XWayland, Wine, and flatpak windows alike, but it lands on whichever window has focus: '
       + 'activate the target first.',
@@ -858,7 +860,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       action: {
         type: 'string',
         required: true,
-        enum: ['move', 'click', 'double_click', 'triple_click', 'down', 'up', 'drag', 'scroll', 'position'],
+        enum: ['move', 'click', 'double_click', 'triple_click', 'down', 'up', 'drag', 'scroll', 'look', 'position'],
         description: 'Which pointer gesture to perform.',
       },
       x: { type: 'integer', description: 'Target x in global logical coordinates.' },
@@ -868,6 +870,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
       button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Mouse button. Default left.' },
       clicks: { type: 'integer', description: 'Override the click count for action=click.' },
       holdMs: { type: 'integer', description: 'Hold the last click this many milliseconds (long press).' },
+      dx: { type: 'integer', description: 'For look: horizontal turn in relative mouse counts; positive turns right.' },
+      dy: { type: 'integer', description: 'For look: vertical turn in relative mouse counts; positive looks down.' },
+      stepPx: { type: 'integer', description: 'For look: largest single relative move. Default 20.' },
       leaseMs: { type: 'integer', description: 'For down: auto-release the button after this many ms. Default 1000, max 30000.' },
       amount: { type: 'integer', description: 'For scroll: wheel steps; positive scrolls up/left, negative down/right.' },
       horizontal: { type: 'boolean', description: 'For scroll: scroll horizontally instead of vertically.' },

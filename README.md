@@ -325,9 +325,27 @@ mutating ones (`window`, `mouse`, `keyboard`, `a11y_invoke`, `launch`,
 pnpm selfcheck          # tool/registry contract, schema validity, bridge protocol, packaging, licence
 pnpm test:python        # unit tests for identity, keys, matching, mapping, framing
 pnpm test:integration   # live checks against the running desktop
+pnpm test:e2e           # Minecraft through Prism: launch, enter a world, break a tree (needs a signed-in Prism)
 python3 tests/validate_schemas.py            # meta-schema check of every tool schema
 python3 tests/validate_schemas.py --session <log.jsonl>   # every tool in a recorded request
 ```
+
+### Minecraft end-to-end
+
+`tests/e2e_minecraft.py` drives a real game, because a latency-sensitive game is
+what exposes input bugs a static app never will. It restores a pristine world,
+quick-launches straight into it (`prismlauncher -l e2e -a <profile> -w e2e`,
+about 25 s), turns the camera with `cu_mouse look`, walks with timed
+`cu_keyboard hold`, holds the mouse on a trunk with a leased `down`, saves and
+quits, and passes only if Minecraft's own stats file says
+`minecraft:mined -> minecraft:oak_log` rose. Its readiness signal is the game's
+log, not a sleep, and it refuses to type unless the game has focus (a stray
+keystroke on the desktop opens KRunner).
+
+One-time setup: flatpak `org.prismlauncher.PrismLauncher`, sign in to a
+Microsoft account that owns Minecraft Java in Prism, create an instance named
+`e2e` on 1.21.1, then `python3 tests/e2e_minecraft.py --snapshot`, which also
+exercises Create New World through the menus.
 
 `validate_schemas.py` exists because a malformed tool schema is not a local
 problem: schemas travel with **every** model request, so one bad schema makes

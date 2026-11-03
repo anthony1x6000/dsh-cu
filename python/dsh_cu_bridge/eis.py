@@ -125,6 +125,8 @@ def _load_libei() -> Any:
 
     library.ei_device_pointer_motion_absolute.restype = None
     library.ei_device_pointer_motion_absolute.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double]
+    library.ei_device_pointer_motion.restype = None
+    library.ei_device_pointer_motion.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double]
     library.ei_device_button_button.restype = None
     library.ei_device_button_button.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int]
     library.ei_device_scroll_discrete.restype = None
@@ -178,6 +180,9 @@ class EISClient:
     _DEVICE_SLOTS: tuple[tuple[str, str], ...] = (
         ("pointer", "_pointer"),
         ("keyboard", "_keyboard"),
+        # Games that grab the pointer read relative motion only; absolute moves
+        # do nothing to their camera.
+        ("relative", "_relative"),
     )
 
     def __init__(self, dbus_address: str | None = None) -> None:
@@ -188,6 +193,7 @@ class EISClient:
         self._cookie: int = 0
         self._pointer: int = 0
         self._keyboard: int = 0
+        self._relative: int = 0
         self._eis_iface: Any = None
         self._emulating: set[int] = set()
         # The lease watchdog releases from its own thread; one frame at a time.
@@ -380,6 +386,8 @@ class EISClient:
         device = library.ei_event_get_device(event)
         if library.ei_device_has_capability(device, EI_CAP_POINTER_ABSOLUTE) and not self._pointer:
             self._pointer = library.ei_device_ref(device)
+        if library.ei_device_has_capability(device, EI_CAP_POINTER) and not self._relative:
+            self._relative = library.ei_device_ref(device)
         if library.ei_device_has_capability(device, EI_CAP_KEYBOARD) and not self._keyboard:
             self._keyboard = library.ei_device_ref(device)
 
@@ -400,6 +408,15 @@ class EISClient:
         library.ei_device_pointer_motion_absolute(device, float(x), float(y))
         library.ei_device_frame(device, self._now_us())
         self._flush()
+
+    def pointer_move_relative(self, dx: float, dy: float) -> None:
+        """Move the pointer by a delta; the only motion a pointer-grabbing game sees."""
+        library = get_libei()
+        with self._send_lock:
+            device = self._live_device("relative")
+            library.ei_device_pointer_motion(device, float(dx), float(dy))
+            library.ei_device_frame(device, self._now_us())
+            self._flush()
 
     def pointer_button(self, button: int, state: int) -> None:
         """Press or release one mouse button by evdev code."""
@@ -467,6 +484,25 @@ class EISClient:
                 pass
             self._eis_iface = None
         self._cookie = 0
+
+
+def plan_look(dx: int, dy: int, *, max_step: int) -> list[tuple[int, int]]:
+    """Split a camera turn into even steps, each at most ``max_step`` on both axes.
+
+    One huge relative move is clamped or dropped by games; many small ones are a
+    mouse movement. The steps sum to exactly the requested turn.
+    """
+    if max_step <= 0:
+        raise BridgeError("look step size must be positive", "BAD_ARGUMENT")
+    count = max(-(-abs(dx) // max_step), -(-abs(dy) // max_step))
+    steps: list[tuple[int, int]] = []
+    done_x = done_y = 0
+    for index in range(1, count + 1):
+        target_x = round(dx * index / count)
+        target_y = round(dy * index / count)
+        steps.append((target_x - done_x, target_y - done_y))
+        done_x, done_y = target_x, target_y
+    return steps
 
 
 class Input:
@@ -560,6 +596,14 @@ class Input:
                 time.sleep(STEP_SLEEP_S)
         finally:
             self.button_up(to_x, to_y, button=button)
+
+    def look(self, dx: int, dy: int, *, max_step: int = 20) -> int:
+        """Turn the camera by a relative delta, as a run of small mouse movements."""
+        steps = plan_look(dx, dy, max_step=max_step)
+        for step_x, step_y in steps:
+            self._client.pointer_move_relative(step_x, step_y)
+            time.sleep(STEP_SLEEP_S)
+        return len(steps)
 
     def scroll(self, x: int, y: int, *, amount: int, horizontal: bool = False, discrete: bool = True) -> None:
         """Scroll ``amount`` clicks (discrete detents) or pixels at one point."""
