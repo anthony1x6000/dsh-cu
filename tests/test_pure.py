@@ -536,6 +536,47 @@ class SpectacleEnvironmentTests(unittest.TestCase):
         self.assertTrue(path.parent.name == "dsh-cu-screenshots", str(path))
 
 
+class ScreenshotFormatTests(unittest.TestCase):
+    def test_the_default_capture_is_a_jpeg(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            os.environ["DSH_CU_SCREENSHOT_DIR"] = scratch
+            self.addCleanup(os.environ.pop, "DSH_CU_SCREENSHOT_DIR", None)
+            self.assertEqual(shot._target_path(None, "workspace").suffix, ".jpg")
+            self.assertEqual(shot._target_path(None, "workspace", "png").suffix, ".png")
+
+    def test_an_unknown_format_is_refused(self) -> None:
+        with self.assertRaises(rpc.BridgeError) as ctx:
+            shot._target_path(None, "workspace", "bmp")
+        self.assertEqual(ctx.exception.code, "BAD_ARGUMENT")
+
+    def test_an_explicit_file_keeps_its_own_extension(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            self.assertEqual(shot._target_path(f"{scratch}/a.png", "workspace").suffix, ".png")
+
+    def test_a_directory_destination_gets_the_requested_format(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as scratch:
+            self.assertEqual(shot._target_path(scratch, "area", "png").suffix, ".png")
+            self.assertEqual(shot._target_path(scratch, "area").suffix, ".jpg")
+
+    def test_the_saved_bytes_match_the_extension(self) -> None:
+        import tempfile
+
+        from PIL import Image
+
+        image = Image.new("RGB", (16, 16), (10, 20, 30))
+        image.putpixel((3, 3), (200, 100, 50))
+        with tempfile.TemporaryDirectory() as scratch:
+            for name, magic in (("a.jpg", b"\xff\xd8"), ("b.png", b"\x89PNG")):
+                shot._save(image, Path(scratch) / name)
+                self.assertEqual((Path(scratch) / name).read_bytes()[: len(magic)], magic)
+
+
 if __name__ == "__main__":
     unittest.main()
 
